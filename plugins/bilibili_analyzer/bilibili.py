@@ -368,6 +368,11 @@ def transcript_cache_path(bvid: str, cid: int) -> Path:
     return cache_dir() / safe
 
 
+def comments_cache_path(bvid: str, aid: int) -> Path:
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", f"{bvid}_{aid}_comments.json")
+    return cache_dir() / safe
+
+
 def load_cached_transcript(bvid: str, cid: int, max_age_days: int = 30) -> dict[str, Any] | None:
     path = transcript_cache_path(bvid, cid)
     if not path.exists():
@@ -411,12 +416,165 @@ def save_cached_transcript(payload: dict[str, Any]) -> None:
     )
 
 
-def download_audio(bvid: str, cid: int | None = None) -> Path:
+def load_cached_comments(
+    bvid: str, aid: int, max_age_days: int = 7
+) -> dict[str, Any] | None:
+    path = comments_cache_path(bvid, aid)
+    if not path.exists():
+        return None
+    return _load_cache_file(path, max_age_days=max_age_days)
+
+
+def save_cached_comments(payload: dict[str, Any]) -> None:
+    meta = payload.get("metadata") or {}
+    bvid = meta.get("bvid")
+    aid = meta.get("aid")
+    if not bvid or not aid:
+        return
+    comments_cache_path(str(bvid), int(aid)).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def fetch_video_comments(
+    bvid: str,
+    aid: int,
+    *,
+    max_comments: int = 200,
+    sort: str = "hot",
+    include_replies: bool = False,
+    replies_per_comment: int = 3,
+) -> list[dict[str, Any]]:
+    """Fetch Bilibili video comments.
+
+    Uses the stable reply endpoint with pn/ps pagination. Video comments use
+    type=1 and oid=aid. Nested replies are optional and capped because they can
+    explode on popular videos.
+    """
+    max_comments = max(1, int(max_comments or 200))
+    ps = min(20, max(1, max_comments))
+    sort_value = 2 if (sort or "hot").lower() in {"hot", "like", "popular"} else 0
+    comments: list[dict[str, Any]] = []
+    page = 1
+    while len(comments) < max_comments:
+        query = urllib.parse.urlencode(
+            {
+                "type": 1,
+                "oid": int(aid),
+                "pn": page,
+                "ps": ps,
+                "sort": sort_value,
+            }
+        )
+        payload, page_ps = _get_reply_page(query, ps)
+        if payload.get("code") != 0:
+            raise BilibiliError(payload.get("message") or "Could not fetch comments.")
+        data = payload.get("data") or {}
+        replies = data.get("replies") or []
+        if not replies:
+            break
+        for item in replies:
+            comment = _normalize_comment(item)
+            if not comment:
+                continue
+            if include_replies and comment.get("reply_count", 0) > 0:
+                comment["replies"] = fetch_comment_replies(
+                    aid,
+                    int(comment["rpid"]),
+                    max_replies=max(0, int(replies_per_comment or 0)),
+                )
+            comments.append(comment)
+            if len(comments) >= max_comments:
+                break
+        total = int(((data.get("page") or {}).get("count") or 0))
+        if total and page * page_ps >= total:
+            break
+        page += 1
+    return comments
+
+
+def _get_reply_page(query: str, ps: int) -> tuple[dict[str, Any], int]:
+    """Fetch one reply page and retry with smaller ps if Bilibili rejects it."""
+    url = f"https://api.bilibili.com/x/v2/reply?{query}"
+    payload = _get_json(url)
+    if payload.get("code") == 0:
+        return payload, ps
+    message = str(payload.get("message") or "")
+    if "ps out of bounds" not in message.lower():
+        return payload, ps
+
+    parsed = dict(urllib.parse.parse_qsl(query))
+    for fallback_ps in (10, 5, 1):
+        if fallback_ps >= ps:
+            continue
+        parsed["ps"] = str(fallback_ps)
+        retry_query = urllib.parse.urlencode(parsed)
+        retry_payload = _get_json(f"https://api.bilibili.com/x/v2/reply?{retry_query}")
+        if retry_payload.get("code") == 0:
+            return retry_payload, fallback_ps
+        retry_message = str(retry_payload.get("message") or "")
+        if "ps out of bounds" not in retry_message.lower():
+            return retry_payload, fallback_ps
+    return payload, ps
+
+
+def fetch_comment_replies(
+    aid: int, root_rpid: int, *, max_replies: int = 3
+) -> list[dict[str, Any]]:
+    if max_replies <= 0:
+        return []
+    query = urllib.parse.urlencode(
+        {"type": 1, "oid": int(aid), "root": int(root_rpid), "pn": 1, "ps": max_replies}
+    )
+    try:
+        payload = _get_json(f"https://api.bilibili.com/x/v2/reply/reply?{query}")
+    except Exception:
+        return []
+    if payload.get("code") != 0:
+        return []
+    replies = ((payload.get("data") or {}).get("replies") or [])[:max_replies]
+    return [comment for item in replies if (comment := _normalize_comment(item))]
+
+
+def _normalize_comment(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    message = str(((item.get("content") or {}).get("message") or "")).strip()
+    if not message:
+        return None
+    member = item.get("member") or {}
+    return {
+        "rpid": int(item.get("rpid") or 0),
+        "root": int(item.get("root") or 0),
+        "parent": int(item.get("parent") or 0),
+        "user": str(member.get("uname") or ""),
+        "mid": str(member.get("mid") or ""),
+        "message": message,
+        "like": int(item.get("like") or 0),
+        "reply_count": int(item.get("rcount") or 0),
+        "ctime": int(item.get("ctime") or 0),
+    }
+
+
+def download_audio(
+    bvid: str,
+    cid: int | None = None,
+    *,
+    prefer_playurl: bool = False,
+) -> Path:
     outtmpl = str(cache_dir() / f"{bvid}_{cid or 'audio'}.%(ext)s")
     url = f"https://www.bilibili.com/video/{bvid}"
     if cid:
         url = f"{url}?p=1"
 
+    if cid and prefer_playurl:
+        try:
+            return download_audio_via_playurl(bvid, cid)
+        except Exception:
+            pass
+
+    ytdlp_error = ""
     try:
         import yt_dlp  # type: ignore
 
@@ -453,16 +611,66 @@ def download_audio(bvid: str, cid: int | None = None) -> Path:
             check=False,
         )
         if completed.returncode != 0:
-            raise BilibiliError(
-                "yt-dlp audio download failed: "
-                + (completed.stderr or completed.stdout)[-1000:]
-            )
+            ytdlp_error = "yt-dlp audio download failed: " + (
+                completed.stderr or completed.stdout
+            )[-1000:]
+    except Exception as exc:
+        ytdlp_error = f"yt-dlp audio download failed: {exc}"
 
     matches = sorted(cache_dir().glob(f"{bvid}_{cid or 'audio'}.*"))
     audio = next((p for p in matches if p.suffix.lower() in {".m4a", ".mp3", ".wav", ".webm"}), None)
+    if not audio and cid:
+        try:
+            audio = download_audio_via_playurl(bvid, cid)
+        except Exception as exc:
+            detail = f"; direct playurl fallback failed: {exc}"
+            raise BilibiliError(
+                (ytdlp_error or "Audio download completed but no audio file was found.")
+                + detail
+            ) from exc
     if not audio:
-        raise BilibiliError("Audio download completed but no audio file was found.")
+        raise BilibiliError(
+            ytdlp_error or "Audio download completed but no audio file was found."
+        )
     return audio
+
+
+def download_audio_via_playurl(bvid: str, cid: int) -> Path:
+    query = urllib.parse.urlencode(
+        {"bvid": bvid, "cid": cid, "fnval": 16, "fourk": 1}
+    )
+    payload = _get_json(f"https://api.bilibili.com/x/player/playurl?{query}")
+    if payload.get("code") != 0:
+        raise BilibiliError(payload.get("message") or "Could not fetch playurl.")
+    audio_items = (((payload.get("data") or {}).get("dash") or {}).get("audio") or [])
+    if not audio_items:
+        raise BilibiliError("Bilibili playurl did not return audio streams.")
+    best = max(audio_items, key=lambda item: int(item.get("bandwidth") or 0))
+    audio_url = best.get("baseUrl") or best.get("base_url")
+    if not audio_url:
+        raise BilibiliError("Bilibili playurl audio stream has no URL.")
+    output = cache_dir() / f"{bvid}_{cid}.m4a"
+    _download_url_to_file(str(audio_url), output, referer=f"https://www.bilibili.com/video/{bvid}/")
+    output.with_suffix(output.suffix + ".url").write_text(str(audio_url), encoding="utf-8")
+    return output
+
+
+def _download_url_to_file(url: str, output: Path, referer: str) -> None:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+    }
+    cookie = _cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with output.open("wb") as fh:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
 
 
 def _bilibili_cookiejar() -> CookieJar | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,18 @@ class AsrError(RuntimeError):
     pass
 
 
+def _has_bailian_key() -> bool:
+    return bool(
+        os.getenv("DASHSCOPE_API_KEY")
+        or os.getenv("BAILIAN_TOKEN_PLAN_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+
+
 def has_asr_provider(provider: str = "auto") -> bool:
     provider = (provider or "auto").strip().lower()
+    if provider in {"auto", "bailian", "dashscope", "aliyun"} and _has_bailian_key():
+        return True
     if provider in {"auto", "command"} and os.getenv("BILIBILI_ASR_COMMAND"):
         return True
     if provider in {"auto", "faster_whisper", "faster-whisper", "local"}:
@@ -52,6 +63,11 @@ def _normalize_segments(value: Any) -> list[dict[str, Any]]:
 
 def transcribe_audio(audio_path: Path, provider: str = "auto") -> tuple[list[dict[str, Any]], str]:
     provider = (provider or "auto").strip().lower()
+    command = os.getenv("BILIBILI_ASR_COMMAND", "").replace("\\", "/")
+    if provider in {"bailian", "dashscope", "aliyun"}:
+        return _transcribe_with_bailian(audio_path), "dashscope"
+    if provider == "auto" and _has_bailian_key() and "bilibili_asr_bailian.py" in command:
+        return _transcribe_with_bailian(audio_path), "dashscope"
     if provider in {"auto", "command"} and os.getenv("BILIBILI_ASR_COMMAND"):
         return _transcribe_with_command(audio_path), "command"
     if provider in {"auto", "faster_whisper", "faster-whisper", "local"}:
@@ -77,6 +93,8 @@ def _transcribe_with_command(audio_path: Path) -> list[dict[str, Any]]:
         shell=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=int(os.getenv("BILIBILI_ASR_TIMEOUT", "3600")),
         check=False,
     )
@@ -91,12 +109,75 @@ def _transcribe_with_command(audio_path: Path) -> list[dict[str, Any]]:
         return _normalize_segments(output)
 
 
+def _transcribe_with_bailian(audio_path: Path) -> list[dict[str, Any]]:
+    script = Path(__file__).resolve().parents[2] / "scripts" / "bilibili_asr_bailian.py"
+    command = [sys.executable, str(script), str(audio_path)]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=int(os.getenv("BILIBILI_ASR_TIMEOUT", "3600")),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AsrError(
+            "Bailian/DashScope ASR failed: " + (completed.stderr or completed.stdout)[-1000:]
+        )
+    try:
+        return _normalize_segments(json.loads(completed.stdout))
+    except json.JSONDecodeError as exc:
+        raise AsrError(
+            "Bailian/DashScope ASR returned non-JSON output: "
+            + completed.stdout[-1000:]
+        ) from exc
+
+
 def _transcribe_with_faster_whisper(audio_path: Path) -> list[dict[str, Any]]:
+    if os.getenv("BILIBILI_WHISPER_IN_PROCESS", "").strip() == "1":
+        return _transcribe_with_faster_whisper_in_process(audio_path)
+
+    command = [
+        sys.executable,
+        "-m",
+        "plugins.bilibili_analyzer.whisper_worker",
+        str(audio_path),
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=int(os.getenv("BILIBILI_ASR_TIMEOUT", "3600")),
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if len(detail) > 2000:
+            detail = detail[-2000:]
+        exit_hex = f"0x{completed.returncode & 0xFFFFFFFF:08X}"
+        raise AsrError(
+            "faster-whisper worker failed "
+            f"(exit {completed.returncode}, {exit_hex}). "
+            f"{detail or 'No traceback was emitted; this is likely a native runtime crash.'}"
+        )
+    try:
+        return _normalize_segments(json.loads(completed.stdout))
+    except json.JSONDecodeError as exc:
+        raise AsrError(
+            "faster-whisper worker returned non-JSON output: "
+            + completed.stdout[-1000:]
+        ) from exc
+
+
+def _transcribe_with_faster_whisper_in_process(audio_path: Path) -> list[dict[str, Any]]:
     from faster_whisper import WhisperModel  # type: ignore
 
     model_name = os.getenv("BILIBILI_WHISPER_MODEL", "medium")
-    device = os.getenv("BILIBILI_WHISPER_DEVICE", "auto")
-    compute_type = os.getenv("BILIBILI_WHISPER_COMPUTE_TYPE", "auto")
+    device = os.getenv("BILIBILI_WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("BILIBILI_WHISPER_COMPUTE_TYPE", "int8")
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
     segments, _info = model.transcribe(
         str(audio_path),

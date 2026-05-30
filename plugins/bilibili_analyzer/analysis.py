@@ -55,13 +55,33 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
                 "required": ["fact", "timestamps"],
             },
         },
+        "audience_comments": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "high_information_feedback": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "questions_or_requests": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "disagreements_or_corrections": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+        },
         "summary": {"type": "string"},
     },
     "required": ["video", "main_thesis", "viewpoints", "summary"],
 }
 
 
-def transcript_to_text(segments: list[dict[str, Any]], max_chars: int | None = None) -> str:
+def transcript_to_text(
+    segments: list[dict[str, Any]], max_chars: int | None = None
+) -> str:
     lines = []
     total = 0
     for seg in segments:
@@ -75,7 +95,9 @@ def transcript_to_text(segments: list[dict[str, Any]], max_chars: int | None = N
     return "\n".join(lines)
 
 
-def chunk_segments(segments: list[dict[str, Any]], chunk_seconds: int = 240) -> list[list[dict[str, Any]]]:
+def chunk_segments(
+    segments: list[dict[str, Any]], chunk_seconds: int = 240
+) -> list[list[dict[str, Any]]]:
     if not segments:
         return []
     chunks: list[list[dict[str, Any]]] = []
@@ -98,6 +120,7 @@ def analyze_transcript(
     metadata: dict[str, Any],
     segments: list[dict[str, Any]],
     *,
+    comments: list[dict[str, Any]] | None = None,
     output_format: str = "markdown",
     chunk_minutes: int = 4,
     max_tokens: int = 3000,
@@ -110,8 +133,8 @@ def analyze_transcript(
                 {
                     "role": "system",
                     "content": (
-                        "你是视频文稿分析助手。基于带时间戳文稿提取本段的核心观点、"
-                        "论据、反驳对象、关键事实。忠于原文，不要补充外部信息。"
+                        "你是视频文稿分析助手。基于带时间戳的文稿提取本段的"
+                        "核心观点、论据、反驳对象和关键事实。忠于原文，不要补充外部信息。"
                     ),
                 },
                 {
@@ -140,6 +163,8 @@ def analyze_transcript(
         "你是B站视频观点分析专家，基于下面带时间戳的视频分段笔记完成结构化分析。"
         "必须忠于原文，区分UP主主观观点和客观事实，不脑补额外信息。"
         "每个观点尽量附带时间戳。"
+        "如果提供了过滤后的评论，只总结高信息量反馈、问题、分歧和纠正；"
+        "忽略纯情绪、重复和低信息量表态。"
     )
     structured = llm.complete_structured(
         instructions=instructions,
@@ -150,6 +175,7 @@ def analyze_transcript(
                     {
                         "metadata": metadata,
                         "chunk_notes": chunk_notes,
+                        "filtered_comments": comments or [],
                     },
                     ensure_ascii=False,
                 ),
@@ -162,8 +188,13 @@ def analyze_transcript(
         max_tokens=max_tokens,
         purpose="bilibili_global_analysis",
     )
-    parsed = structured.parsed if isinstance(structured.parsed, dict) else {"summary": structured.text}
+    parsed = (
+        structured.parsed
+        if isinstance(structured.parsed, dict)
+        else {"summary": structured.text}
+    )
     parsed["chunk_notes"] = chunk_notes
+    parsed["filtered_comments"] = comments or []
     if output_format == "json":
         return parsed
     parsed["markdown"] = render_markdown(parsed)
@@ -198,4 +229,31 @@ def render_markdown(data: dict[str, Any]) -> str:
         stamps = "、".join(item.get("timestamps") or [])
         lines.append(f"- {item.get('fact', '')}（{stamps}）")
     lines.extend(["", "## 简要总结", data.get("summary", "")])
+
+    audience = data.get("audience_comments") or {}
+    comments = data.get("filtered_comments") or []
+    if audience or comments:
+        lines.extend(["", "## 评论区高信息量反馈"])
+        if audience.get("summary"):
+            lines.append(str(audience.get("summary")))
+        for label, key in (
+            ("高信息量反馈", "high_information_feedback"),
+            ("问题/请求", "questions_or_requests"),
+            ("分歧/纠正", "disagreements_or_corrections"),
+        ):
+            items = audience.get(key) or []
+            if items:
+                lines.extend(["", f"### {label}"])
+                for item in items:
+                    lines.append(f"- {item}")
+        if comments:
+            lines.extend(["", "### 代表性评论"])
+            for item in comments[:10]:
+                score = item.get("information_score", "")
+                like = item.get("like", 0)
+                user = item.get("user", "")
+                lines.append(
+                    f"- {item.get('message', '')} "
+                    f"(user={user}, like={like}, score={score})"
+                )
     return "\n".join(lines).strip()

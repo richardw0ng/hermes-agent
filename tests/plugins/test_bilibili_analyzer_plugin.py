@@ -46,6 +46,24 @@ def test_command_asr_normalizes_json(monkeypatch, tmp_path):
     assert segments == [{"start": 1.0, "end": 3.0, "text": "你好"}]
 
 
+def test_faster_whisper_worker_failure_becomes_asr_error(monkeypatch, tmp_path):
+    audio = tmp_path / "audio.m4a"
+    audio.write_text("x", encoding="utf-8")
+
+    def fake_run(*_args, **_kwargs):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="native crash")
+
+    monkeypatch.delenv("BILIBILI_WHISPER_IN_PROCESS", raising=False)
+    monkeypatch.setattr(asr.subprocess, "run", fake_run)
+    try:
+        asr.transcribe_audio(audio, "faster_whisper")
+    except asr.AsrError as exc:
+        assert "worker failed" in str(exc)
+        assert "native crash" in str(exc)
+    else:
+        raise AssertionError("worker failure should raise AsrError")
+
+
 def test_cookie_header_reads_repo_local_cookie_file(monkeypatch, tmp_path):
     from plugins.bilibili_analyzer import private_cookies
 
@@ -102,7 +120,7 @@ def test_fetch_transcript_uses_cache(monkeypatch, tmp_path):
             "bvid": "BV1xx411c7mD",
             "cid": 123,
             "source": "subtitle",
-            "cache_schema_version": 3,
+            "cache_schema_version": tools.CACHE_SCHEMA_VERSION,
         },
         "segments": [{"start": 0, "end": 1, "text": "cached"}],
     }
@@ -237,6 +255,52 @@ def test_suspicious_direct_subtitle_can_use_ytdlp_fallback(monkeypatch, tmp_path
     assert result["segments"][0]["text"] == "full"
 
 
+def test_topic_mismatched_subtitle_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(
+        tools,
+        "fetch_video_info",
+        lambda _bvid: {
+            "title": "普通人如何学习短线交易技巧",
+            "owner": "up",
+            "desc": "",
+            "pages": [{"cid": 1, "page": 1, "duration": 300, "part": ""}],
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_subtitle_segments",
+        lambda _bvid, _cid: (
+            [
+                {"start": 0, "end": 120, "text": "沃尔玛超市烘焙区有很多新品"},
+                {"start": 120, "end": 295, "text": "这个可颂和零食区的价格比较适合探店"},
+            ],
+            {"fetcher": "bilibili_api"},
+        ),
+    )
+    monkeypatch.setattr(tools, "fetch_subtitle_segments_ytdlp", lambda *_args: ([], None))
+    monkeypatch.setattr(tools, "has_asr_provider", lambda _provider="auto": False)
+
+    try:
+        tools.fetch_transcript("BV1xx411c7mD", use_cache=False)
+    except bilibili.BilibiliError as exc:
+        assert "topic-mismatched" in str(exc)
+    else:
+        raise AssertionError("topic-mismatched subtitle should fail closed")
+
+
+def test_topic_matched_subtitle_passes_title_check():
+    warnings = tools._subtitle_quality_warnings(
+        [
+            {"start": 0, "end": 120, "text": "普通人学习短线交易技巧时要先理解风险"},
+            {"start": 120, "end": 295, "text": "短线交易不是神秘方法，也要有自己的计划"},
+        ],
+        300,
+        title="普通人如何学习短线交易技巧",
+    )
+    assert warnings == []
+
+
 def test_download_audio_cli_avoids_ffmpeg_postprocessor(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     real_import = builtins.__import__
@@ -265,6 +329,326 @@ def test_download_audio_cli_avoids_ffmpeg_postprocessor(monkeypatch, tmp_path):
     assert calls["kwargs"]["errors"] == "replace"
 
 
+def test_download_audio_falls_back_to_playurl(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    real_import = builtins.__import__
+
+    class FakeYdl:
+        def __init__(self, _options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def download(self, _urls):
+            raise RuntimeError("no formats")
+
+    fake_module = types.SimpleNamespace(YoutubeDL=FakeYdl)
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yt_dlp":
+            return fake_module
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        bilibili,
+        "download_audio_via_playurl",
+        lambda bvid, cid: bilibili.cache_dir() / f"{bvid}_{cid}.m4a",
+    )
+    audio = bilibili.download_audio("BV1xx411c7mD", 1)
+    assert audio.name == "BV1xx411c7mD_1.m4a"
+
+
+def test_download_audio_via_playurl_selects_highest_bandwidth(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(
+        bilibili,
+        "_get_json",
+        lambda _url: {
+            "code": 0,
+            "data": {
+                "dash": {
+                    "audio": [
+                        {"bandwidth": 100, "baseUrl": "https://example.test/low.m4s"},
+                        {"bandwidth": 300, "baseUrl": "https://example.test/high.m4s"},
+                    ]
+                }
+            },
+        },
+    )
+    seen = {}
+
+    def fake_download(url, output, referer):
+        seen["url"] = url
+        seen["referer"] = referer
+        output.write_bytes(b"audio")
+
+    monkeypatch.setattr(bilibili, "_download_url_to_file", fake_download)
+    path = bilibili.download_audio_via_playurl("BV1xx411c7mD", 1)
+    assert seen["url"] == "https://example.test/high.m4s"
+    assert seen["referer"].endswith("/BV1xx411c7mD/")
+    assert path.read_bytes() == b"audio"
+    assert path.with_suffix(path.suffix + ".url").read_text(encoding="utf-8") == "https://example.test/high.m4s"
+
+
+def test_fetch_transcript_prefers_playurl_for_bailian_asr(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("BILIBILI_ASR_COMMAND", "python scripts/bilibili_asr_bailian.py {audio_path}")
+    monkeypatch.setattr(bilibili, "extract_bvid", lambda _value: "BV1xx411c7mD")
+    monkeypatch.setattr(
+        tools,
+        "fetch_video_info",
+        lambda _bvid: {
+            "bvid": "BV1xx411c7mD",
+            "aid": 1,
+            "title": "title",
+            "owner": "owner",
+            "desc": "",
+            "duration": 10,
+            "pages": [{"cid": 1, "page": 1, "part": "p1", "duration": 10}],
+        },
+    )
+    monkeypatch.setattr(tools, "fetch_subtitle_segments", lambda *_args: ([], None))
+    monkeypatch.setattr(tools, "fetch_subtitle_segments_ytdlp", lambda *_args: ([], None))
+    seen = {}
+
+    def fake_download(bvid, cid, *, prefer_playurl=False):
+        seen["prefer_playurl"] = prefer_playurl
+        audio = tmp_path / f"{bvid}_{cid}.m4a"
+        audio.write_bytes(b"audio")
+        return audio
+
+    monkeypatch.setattr(tools, "download_audio", fake_download)
+    monkeypatch.setattr(
+        tools,
+        "transcribe_audio",
+        lambda _audio, _provider: ([{"start": 0, "end": 1, "text": "hello"}], "command"),
+    )
+
+    result = tools.fetch_transcript("BV1xx411c7mD", use_cache=False)
+    assert seen["prefer_playurl"] is True
+    assert result["segments"][0]["text"] == "hello"
+
+
+def test_fetch_comments_filters_low_information_reactions(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(
+        tools,
+        "fetch_video_info",
+        lambda _bvid: {
+            "bvid": "BV1xx411c7mD",
+            "aid": 123,
+            "title": "短线交易入门",
+            "owner": "owner",
+            "desc": "",
+            "duration": 10,
+            "pages": [{"cid": 1, "page": 1, "part": "p1", "duration": 10}],
+        },
+    )
+
+    def fake_comments(*_args, **_kwargs):
+        return [
+            {"rpid": 1, "user": "a", "message": "哈哈哈哈", "like": 100, "reply_count": 0, "ctime": 1},
+            {"rpid": 2, "user": "b", "message": "支持支持支持", "like": 50, "reply_count": 0, "ctime": 2},
+            {
+                "rpid": 3,
+                "user": "c",
+                "message": "我觉得新手先看风险和仓位管理更重要，因为短线交易亏损往往来自瞎买瞎卖。",
+                "like": 8,
+                "reply_count": 2,
+                "ctime": 3,
+            },
+            {
+                "rpid": 4,
+                "user": "d",
+                "message": "请问视频里提到的书适合完全没有交易经验的人吗？有没有先后顺序？",
+                "like": 2,
+                "reply_count": 6,
+                "ctime": 4,
+            },
+        ]
+
+    monkeypatch.setattr(tools, "fetch_video_comments", fake_comments)
+    result = tools.fetch_comments("BV1xx411c7mD", use_cache=False)
+    messages = [item["message"] for item in result["comments"]]
+    assert "哈哈哈哈" not in messages
+    assert "支持支持支持" not in messages
+    assert any("仓位管理" in message for message in messages)
+    assert any("先后顺序" in message for message in messages)
+    assert result["metadata"]["raw_comment_count"] == 4
+    assert result["metadata"]["filtered_comment_count"] == 2
+
+
+def test_fetch_video_comments_parses_reply_api(monkeypatch):
+    calls = []
+
+    def fake_get_json(url):
+        calls.append(url)
+        if "pn=1" in url:
+            return {
+                "code": 0,
+                "data": {
+                    "page": {"count": 2},
+                    "replies": [
+                        {
+                            "rpid": 10,
+                            "root": 0,
+                            "parent": 0,
+                            "member": {"uname": "alice", "mid": "1"},
+                            "content": {"message": "这个观点有数据支撑吗？"},
+                            "like": 12,
+                            "rcount": 0,
+                            "ctime": 100,
+                        }
+                    ],
+                },
+            }
+        return {"code": 0, "data": {"page": {"count": 2}, "replies": []}}
+
+    monkeypatch.setattr(bilibili, "_get_json", fake_get_json)
+    comments = bilibili.fetch_video_comments("BV1xx411c7mD", 123, max_comments=1)
+    assert len(comments) == 1
+    assert comments[0]["user"] == "alice"
+    assert comments[0]["message"] == "这个观点有数据支撑吗？"
+    assert "type=1" in calls[0]
+    assert "oid=123" in calls[0]
+
+
+def test_fetch_video_comments_retries_when_ps_out_of_bounds(monkeypatch):
+    calls = []
+
+    def fake_get_json(url):
+        calls.append(url)
+        if "ps=20" in url:
+            return {"code": -400, "message": "ps out of bounds"}
+        return {
+            "code": 0,
+            "data": {
+                "page": {"count": 1},
+                "replies": [
+                    {
+                        "rpid": 10,
+                        "root": 0,
+                        "parent": 0,
+                        "member": {"uname": "alice", "mid": "1"},
+                        "content": {"message": "comment with enough detail"},
+                        "like": 12,
+                        "rcount": 0,
+                        "ctime": 100,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bilibili, "_get_json", fake_get_json)
+    comments = bilibili.fetch_video_comments("BV1xx411c7mD", 123, max_comments=200)
+    assert len(comments) == 1
+    assert "ps=20" in calls[0]
+    assert any("ps=10" in call for call in calls)
+
+
+def test_analyze_handler_returns_stage_and_partial_data_on_analysis_error(monkeypatch):
+    transcript = {
+        "metadata": {"bvid": "BV1xx411c7mD", "usable_for_analysis": True},
+        "segments": [{"start": 0, "end": 1, "text": "hello"}],
+    }
+    comments = {
+        "metadata": {"bvid": "BV1xx411c7mD"},
+        "comments": [
+            {
+                "user": "alice",
+                "message": "x" * 400,
+                "like": 10,
+                "reply_count": 0,
+                "information_score": 5,
+                "filter_reasons": ["substantial_text"],
+            }
+        ],
+    }
+    seen = {}
+
+    monkeypatch.setattr(tools, "fetch_transcript", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(tools, "fetch_comments", lambda *_args, **_kwargs: comments)
+
+    def fake_analyze(_llm, _metadata, _segments, **kwargs):
+        seen["comments"] = kwargs["comments"]
+        raise RuntimeError("model timeout")
+
+    monkeypatch.setattr(tools, "analyze_transcript", fake_analyze)
+    handler = tools.make_analyze_handler(object())
+    result = json.loads(
+        handler(
+            {
+                "url_or_bvid": "BV1xx411c7mD",
+                "include_comments": True,
+                "comment_limit": 30,
+            }
+        )
+    )
+    assert result["success"] is False
+    assert result["stage"] == "analyze"
+    assert result["transcript"] == transcript
+    assert result["comments"]["analysis_comment_count"] == 1
+    assert len(seen["comments"][0]["message"]) <= 240
+
+
+def test_analyze_handler_archives_to_standard_output_dir_by_default(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    transcript = {
+        "metadata": {
+            "bvid": "BV1xx411c7mD",
+            "cid": 123,
+            "title": "Sample Title",
+            "usable_for_analysis": True,
+        },
+        "segments": [{"start": 0, "end": 1, "text": "hello"}],
+    }
+    analysis_result = {"markdown": "# Analysis\n\nok"}
+
+    monkeypatch.setattr(tools, "fetch_transcript", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        tools,
+        "analyze_transcript",
+        lambda *_args, **_kwargs: analysis_result,
+    )
+    handler = tools.make_analyze_handler(object())
+    result = json.loads(handler({"url_or_bvid": "BV1xx411c7mD"}))
+
+    output_dir = tmp_path / "outputs" / "bilibili_analyzer"
+    output_file = output_dir / result["output_path"].split(str(output_dir))[-1].lstrip("\\/")
+    assert result["success"] is True
+    assert result["output_path"].startswith(str(output_dir))
+    assert result["output_path"].endswith("_analysis.md")
+    assert "# Analysis" in output_file.read_text(encoding="utf-8")
+
+
+def test_analyze_handler_can_disable_auto_archive(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    transcript = {
+        "metadata": {"bvid": "BV1xx411c7mD", "cid": 123, "usable_for_analysis": True},
+        "segments": [{"start": 0, "end": 1, "text": "hello"}],
+    }
+
+    monkeypatch.setattr(tools, "fetch_transcript", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        tools,
+        "analyze_transcript",
+        lambda *_args, **_kwargs: {"markdown": "# Analysis\n\nok"},
+    )
+    handler = tools.make_analyze_handler(object())
+    result = json.loads(
+        handler({"url_or_bvid": "BV1xx411c7mD", "persist_file": False})
+    )
+
+    assert result["success"] is True
+    assert result["output_path"] == ""
+    assert not (tmp_path / "outputs" / "bilibili_analyzer").exists()
+
+
 def test_plugin_registers_tools():
     from plugins.bilibili_analyzer import register
 
@@ -278,5 +662,9 @@ def test_plugin_registers_tools():
 
     register(Ctx())
     names = {item["name"] for item in registered}
-    assert names == {"bilibili_fetch_transcript", "bilibili_analyze_video"}
+    assert names == {
+        "bilibili_fetch_transcript",
+        "bilibili_analyze_video",
+        "bilibili_fetch_comments",
+    }
     assert all(item["toolset"] == "bilibili" for item in registered)

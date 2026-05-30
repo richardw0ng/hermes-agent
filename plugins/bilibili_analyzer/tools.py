@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +15,18 @@ from .bilibili import (
     cache_dir,
     download_audio,
     extract_bvid,
+    fetch_video_comments,
     fetch_subtitle_segments,
     fetch_subtitle_segments_ytdlp,
     fetch_video_info,
+    load_cached_comments,
     load_cached_transcript,
     load_cached_transcript_for_page,
+    save_cached_comments,
     save_cached_transcript,
 )
+
+CACHE_SCHEMA_VERSION = 4
 
 BILI_FETCH_TRANSCRIPT_SCHEMA = {
     "name": "bilibili_fetch_transcript",
@@ -129,12 +136,90 @@ BILI_ANALYZE_VIDEO_SCHEMA = {
             },
             "persist_file": {
                 "type": "boolean",
-                "description": "Write transcript and analysis to a persistent markdown file.",
+                "description": (
+                    "Archive transcript and analysis to the plugin's standard output "
+                    "directory. Defaults to true."
+                ),
+                "default": True,
+            },
+            "include_comments": {
+                "type": "boolean",
+                "description": "Fetch and include high-information comments in analysis.",
                 "default": False,
+            },
+            "max_comments": {
+                "type": "integer",
+                "description": "Maximum raw comments to fetch when include_comments is true.",
+                "default": 200,
+            },
+            "comment_limit": {
+                "type": "integer",
+                "description": "Maximum filtered comments to pass into analysis.",
+                "default": 30,
+            },
+            "include_comment_replies": {
+                "type": "boolean",
+                "description": "Fetch a small number of nested replies for comment analysis.",
+                "default": False,
+            },
+            "comment_sort": {
+                "type": "string",
+                "description": "Comment sort: hot or time. Defaults to hot.",
+                "default": "hot",
             },
             "output_path": {
                 "type": "string",
-                "description": "Optional output markdown path when persist_file is true.",
+                "description": (
+                    "Optional output markdown path. If omitted, the plugin writes to "
+                    "outputs/bilibili_analyzer automatically."
+                ),
+            },
+        },
+        "required": ["url_or_bvid"],
+    },
+}
+
+BILI_FETCH_COMMENTS_SCHEMA = {
+    "name": "bilibili_fetch_comments",
+    "description": (
+        "Fetch and filter high-information comments from a Bilibili video."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url_or_bvid": {
+                "type": "string",
+                "description": "Bilibili URL, b23.tv short link, or BV id.",
+            },
+            "max_comments": {
+                "type": "integer",
+                "description": "Maximum raw comments to fetch. Defaults to 200.",
+                "default": 200,
+            },
+            "comment_limit": {
+                "type": "integer",
+                "description": "Maximum filtered comments to return. Defaults to 30.",
+                "default": 30,
+            },
+            "sort": {
+                "type": "string",
+                "description": "Comment sort: hot or time. Defaults to hot.",
+                "default": "hot",
+            },
+            "include_replies": {
+                "type": "boolean",
+                "description": "Fetch a small number of nested replies for informative top comments.",
+                "default": False,
+            },
+            "use_cache": {
+                "type": "boolean",
+                "description": "Reuse cached comments. Defaults to true.",
+                "default": True,
+            },
+            "force_refresh": {
+                "type": "boolean",
+                "description": "Ignore cached comments and fetch again.",
+                "default": False,
             },
         },
         "required": ["url_or_bvid"],
@@ -148,6 +233,27 @@ def check_requirements() -> bool:
 
 def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _bool_arg(args: dict[str, Any], name: str, default: bool) -> bool:
+    value = args.get(name, default)
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _prefer_playurl_audio() -> bool:
+    command = os.getenv("BILIBILI_ASR_COMMAND", "")
+    return (
+        os.getenv("BILIBILI_PREFER_PLAYURL_AUDIO", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        or bool(
+            os.getenv("DASHSCOPE_API_KEY")
+            or os.getenv("BAILIAN_TOKEN_PLAN_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
+        or "bilibili_asr_bailian.py" in command.replace("\\", "/")
+    )
 
 
 def handle_fetch_transcript(args: dict[str, Any], **_kwargs) -> str:
@@ -167,6 +273,77 @@ def handle_fetch_transcript(args: dict[str, Any], **_kwargs) -> str:
         return _json({"success": False, "error": str(exc)})
 
 
+def handle_fetch_comments(args: dict[str, Any], **_kwargs) -> str:
+    try:
+        payload = fetch_comments(
+            args.get("url_or_bvid") or "",
+            max_comments=int(args.get("max_comments") or 200),
+            comment_limit=int(args.get("comment_limit") or 30),
+            sort=str(args.get("sort") or "hot"),
+            include_replies=bool(args.get("include_replies", False)),
+            use_cache=bool(args.get("use_cache", True)),
+            force_refresh=bool(args.get("force_refresh", False)),
+        )
+        return _json({"success": True, **payload})
+    except Exception as exc:
+        return _json({"success": False, "error": str(exc)})
+
+
+def fetch_comments(
+    url_or_bvid: str,
+    *,
+    max_comments: int = 200,
+    comment_limit: int = 30,
+    sort: str = "hot",
+    include_replies: bool = False,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    bvid = extract_bvid(url_or_bvid)
+    info = fetch_video_info(bvid)
+    aid = int(info.get("aid") or 0)
+    if not aid:
+        raise BilibiliError(f"Could not resolve aid for {bvid}.")
+
+    if use_cache and not force_refresh:
+        cached = load_cached_comments(bvid, aid)
+        if cached:
+            cached["cache_hit"] = True
+            return cached
+
+    raw_comments = fetch_video_comments(
+        bvid,
+        aid,
+        max_comments=max_comments,
+        sort=sort,
+        include_replies=include_replies,
+    )
+    filtered_comments = filter_informative_comments(
+        raw_comments,
+        limit=comment_limit,
+    )
+    payload = {
+        "metadata": {
+            "bvid": bvid,
+            "aid": aid,
+            "title": info.get("title") or "",
+            "owner": info.get("owner") or "",
+            "sort": sort,
+            "include_replies": include_replies,
+            "raw_comment_count": len(raw_comments),
+            "filtered_comment_count": len(filtered_comments),
+            "cache_schema_version": 1,
+            "filter": "information_score_v1",
+        },
+        "comments": filtered_comments,
+        "raw_sample": raw_comments[: min(10, len(raw_comments))],
+        "cache_hit": False,
+    }
+    if use_cache:
+        save_cached_comments(payload)
+    return payload
+
+
 def fetch_transcript(
     url_or_bvid: str,
     *,
@@ -183,6 +360,7 @@ def fetch_transcript(
     if cache_allowed:
         cached = load_cached_transcript_for_page(bvid, page)
         if cached and _cache_is_current(cached):
+            _raise_if_unusable_cached(cached, allow_suspicious_subtitle)
             cached["cache_hit"] = True
             return cached
 
@@ -196,6 +374,7 @@ def fetch_transcript(
     if cache_allowed:
         cached = load_cached_transcript(bvid, cid)
         if cached and _cache_is_current(cached):
+            _raise_if_unusable_cached(cached, allow_suspicious_subtitle)
             cached["cache_hit"] = True
             return cached
 
@@ -205,11 +384,21 @@ def fetch_transcript(
     warnings: list[str] = []
     if prefer_subtitle and not force_asr:
         segments, subtitle_meta = fetch_subtitle_segments(bvid, cid)
-        warnings.extend(_subtitle_quality_warnings(segments, selected.get("duration") or info.get("duration") or 0))
+        warnings.extend(
+            _subtitle_quality_warnings(
+                segments,
+                selected.get("duration") or info.get("duration") or 0,
+                title=info.get("title") or "",
+                part=selected.get("part") or "",
+            )
+        )
         if not segments or warnings:
             ytdlp_segments, ytdlp_meta = fetch_subtitle_segments_ytdlp(bvid)
             ytdlp_warnings = _subtitle_quality_warnings(
-                ytdlp_segments, selected.get("duration") or info.get("duration") or 0
+                ytdlp_segments,
+                selected.get("duration") or info.get("duration") or 0,
+                title=info.get("title") or "",
+                part=selected.get("part") or "",
             )
             if ytdlp_segments and (not segments or len(ytdlp_warnings) < len(warnings)):
                 segments = ytdlp_segments
@@ -219,12 +408,12 @@ def fetch_transcript(
     audio_path = None
     if not segments:
         source = "asr"
-        audio_path = download_audio(bvid, cid)
+        audio_path = download_audio(bvid, cid, prefer_playurl=_prefer_playurl_audio())
         segments, asr_provider_used = transcribe_audio(audio_path, asr_provider)
         source = f"asr:{asr_provider_used}"
     elif warnings and has_asr_provider(asr_provider):
         try:
-            audio_path = download_audio(bvid, cid)
+            audio_path = download_audio(bvid, cid, prefer_playurl=_prefer_playurl_audio())
             asr_segments, asr_provider_used = transcribe_audio(audio_path, asr_provider)
             if asr_segments:
                 segments = asr_segments
@@ -254,7 +443,7 @@ def fetch_transcript(
         "source": source,
         "subtitle": subtitle_meta or {},
         "audio_path": str(audio_path) if audio_path else "",
-        "cache_schema_version": 3,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
         "warnings": warnings,
         "quality_status": "suspect" if warnings else "ok",
         "usable_for_analysis": not warnings or source.startswith("asr:"),
@@ -272,6 +461,10 @@ def fetch_transcript(
 
 def make_analyze_handler(llm: Any):
     def _handler(args: dict[str, Any], **_kwargs) -> str:
+        stage = "fetch_transcript"
+        transcript: dict[str, Any] | None = None
+        comments_payload: dict[str, Any] | None = None
+        analysis: dict[str, Any] | None = None
         try:
             transcript = fetch_transcript(
                 args.get("url_or_bvid") or "",
@@ -288,15 +481,35 @@ def make_analyze_handler(llm: Any):
                     "Transcript is marked unusable for analysis. Re-run with force_asr=true "
                     "or explicitly set allow_suspicious_subtitle=true."
                 )
+            comments_for_analysis = None
+            if bool(args.get("include_comments", False)):
+                stage = "fetch_comments"
+                comments_payload = fetch_comments(
+                    args.get("url_or_bvid") or "",
+                    max_comments=int(args.get("max_comments") or 200),
+                    comment_limit=int(args.get("comment_limit") or 30),
+                    sort=str(args.get("comment_sort") or "hot"),
+                    include_replies=bool(args.get("include_comment_replies", False)),
+                    use_cache=bool(args.get("use_cache", True)),
+                    force_refresh=bool(args.get("force_refresh", False)),
+                )
+                comments_for_analysis = _comments_for_analysis(
+                    comments_payload.get("comments") or [],
+                    limit=int(args.get("comment_limit") or 30),
+                )
+                comments_payload["analysis_comment_count"] = len(comments_for_analysis)
+            stage = "analyze"
             analysis = analyze_transcript(
                 llm,
                 transcript["metadata"],
                 transcript["segments"],
+                comments=comments_for_analysis,
                 output_format=str(args.get("output_format") or "markdown"),
                 chunk_minutes=int(args.get("chunk_minutes") or 4),
             )
             output_path = ""
-            if bool(args.get("persist_file", False)):
+            if _bool_arg(args, "persist_file", True):
+                stage = "persist"
                 output_path = _persist_analysis(
                     transcript,
                     analysis,
@@ -306,14 +519,171 @@ def make_analyze_handler(llm: Any):
                 {
                     "success": True,
                     "transcript": transcript,
+                    "comments": comments_payload,
                     "analysis": analysis,
                     "output_path": output_path,
                 }
             )
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _json(
+                {
+                    "success": False,
+                    "stage": stage,
+                    "error": str(exc),
+                    "transcript": transcript,
+                    "comments": comments_payload,
+                    "analysis": analysis,
+                }
+            )
 
     return _handler
+
+
+GENERIC_COMMENT_PATTERNS = (
+    "哈哈",
+    "支持",
+    "牛逼",
+    "厉害",
+    "前排",
+    "来了",
+    "打卡",
+    "三连",
+    "点赞",
+    "收藏",
+    "泪目",
+    "笑死",
+)
+
+
+def _comments_for_analysis(
+    comments: list[dict[str, Any]], *, limit: int = 30, max_chars: int = 240
+) -> list[dict[str, Any]]:
+    """Compact filtered comments before sending them into the global LLM pass."""
+    compacted: list[dict[str, Any]] = []
+    for item in comments[: min(max(1, int(limit or 30)), 12)]:
+        message = _trim_comment_text(str(item.get("message") or ""), max_chars)
+        if not message:
+            continue
+        compact = {
+            "user": item.get("user") or "",
+            "message": message,
+            "like": int(item.get("like") or 0),
+            "reply_count": int(item.get("reply_count") or 0),
+            "information_score": item.get("information_score", 0),
+            "filter_reasons": item.get("filter_reasons") or [],
+        }
+        replies = []
+        for reply in item.get("replies") or []:
+            reply_message = _trim_comment_text(
+                str(reply.get("message") or ""),
+                max(80, max_chars // 2),
+            )
+            if reply_message:
+                replies.append(
+                    {
+                        "user": reply.get("user") or "",
+                        "message": reply_message,
+                        "like": int(reply.get("like") or 0),
+                    }
+                )
+            if len(replies) >= 2:
+                break
+        if replies:
+            compact["replies"] = replies
+        compacted.append(compact)
+    return compacted
+
+
+def _trim_comment_text(text: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def filter_informative_comments(
+    comments: list[dict[str, Any]], *, limit: int = 30
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    scored: list[dict[str, Any]] = []
+    for comment in comments:
+        message = str(comment.get("message") or "").strip()
+        normalized = _normalize_comment_text(message)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        score, reasons = _comment_information_score(comment, normalized)
+        if score < 3:
+            continue
+        item = dict(comment)
+        item["information_score"] = score
+        item["filter_reasons"] = reasons
+        item.pop("mid", None)
+        if item.get("replies"):
+            item["replies"] = filter_informative_comments(
+                item["replies"], limit=3
+            )
+        scored.append(item)
+    scored.sort(
+        key=lambda item: (
+            float(item.get("information_score") or 0),
+            int(item.get("like") or 0),
+            int(item.get("reply_count") or 0),
+        ),
+        reverse=True,
+    )
+    return scored[: max(1, int(limit or 30))]
+
+
+def _normalize_comment_text(text: str) -> str:
+    text = re.sub(r"\s+", "", text or "")
+    text = re.sub(r"\[[^\]]+\]", "", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
+    return text.lower()
+
+
+def _comment_information_score(
+    comment: dict[str, Any], normalized: str
+) -> tuple[float, list[str]]:
+    reasons: list[str] = []
+    text = str(comment.get("message") or "")
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    unique_ratio = len(set(normalized)) / max(1, len(normalized))
+    score = 0.0
+    if cjk_count >= 20:
+        score += 2.0
+        reasons.append("substantial_text")
+    elif cjk_count >= 10:
+        score += 1.0
+    else:
+        score -= 2.0
+        reasons.append("too_short")
+    if unique_ratio < 0.25:
+        score -= 3.0
+        reasons.append("repetitive_text")
+    if any(pattern in text for pattern in GENERIC_COMMENT_PATTERNS) and cjk_count < 30:
+        score -= 2.0
+        reasons.append("generic_reaction")
+    if re.search(r"[?？]|为什么|怎么|如何|请问|区别|逻辑|原因", text):
+        score += 2.0
+        reasons.append("question_or_reasoning")
+    if re.search(r"因为|但是|所以|我觉得|我认为|比如|例如|建议|风险|经验|观点", text):
+        score += 2.0
+        reasons.append("argument_or_experience")
+    if re.search(r"\d|%|年|月|元|万|倍|PE|ROE|仓位|收益|亏|赚|书|交易|短线|长线", text, re.I):
+        score += 1.5
+        reasons.append("specific_terms")
+    like = int(comment.get("like") or 0)
+    reply_count = int(comment.get("reply_count") or 0)
+    if like >= 50:
+        score += 2.0
+        reasons.append("high_like")
+    elif like >= 10:
+        score += 1.0
+    if reply_count >= 5:
+        score += 1.0
+        reasons.append("discussion_thread")
+    return score, reasons
 
 
 def _persist_analysis(
@@ -322,9 +692,7 @@ def _persist_analysis(
     metadata = transcript.get("metadata") or {}
     bvid = str(metadata.get("bvid") or "bilibili")
     cid = str(metadata.get("cid") or "unknown")
-    path = Path(output_path).expanduser() if output_path else (
-        cache_dir().parent / "reports" / "bilibili" / f"{bvid}_{cid}_analysis.md"
-    )
+    path = _archive_output_path(output_path, bvid=bvid, cid=cid, title=str(metadata.get("title") or ""))
     if not path.is_absolute():
         path = Path.cwd() / path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,13 +710,87 @@ def _persist_analysis(
     return str(path)
 
 
+def _archive_output_path(output_path: str, *, bvid: str, cid: str, title: str = "") -> Path:
+    if output_path:
+        return _normalize_cross_platform_path(output_path)
+    filename = "_".join(
+        part for part in (bvid, cid, _safe_filename_part(title)) if part
+    )[:180]
+    return _default_archive_dir() / f"{filename or bvid}_analysis.md"
+
+
+def _default_archive_dir() -> Path:
+    configured = os.getenv("BILIBILI_ANALYZER_OUTPUT_DIR", "").strip()
+    if configured:
+        return _normalize_cross_platform_path(configured)
+
+    preferred = Path.cwd() / "outputs" / "bilibili_analyzer"
+    if _ensure_writable_dir(preferred):
+        return preferred
+    return cache_dir().parent.parent / "outputs" / "bilibili_analyzer"
+
+
+def _ensure_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _normalize_cross_platform_path(path_value: str) -> Path:
+    value = (path_value or "").strip()
+    if os.name == "nt":
+        match = re.match(r"^/mnt/([A-Za-z])/(.*)$", value)
+        if match:
+            drive = match.group(1).upper()
+            rest = match.group(2).replace("/", "\\")
+            return Path(f"{drive}:\\{rest}")
+    elif re.match(r"^[A-Za-z]:[\\/]", value):
+        drive = value[0].lower()
+        rest = value[2:].lstrip("\\/").replace("\\", "/")
+        return Path(f"/mnt/{drive}/{rest}")
+    return Path(value).expanduser()
+
+
+def _safe_filename_part(value: str, max_len: int = 48) -> str:
+    text = re.sub(r"\s+", "_", value or "").strip("_")
+    text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_.-]+", "_", text)
+    return text.strip("._-")[:max_len]
+
+
 def _cache_is_current(payload: dict[str, Any]) -> bool:
     metadata = payload.get("metadata") or {}
-    return int(metadata.get("cache_schema_version") or 0) >= 3
+    return int(metadata.get("cache_schema_version") or 0) >= CACHE_SCHEMA_VERSION
+
+
+def _raise_if_unusable_cached(
+    payload: dict[str, Any], allow_suspicious_subtitle: bool
+) -> None:
+    metadata = payload.get("metadata") or {}
+    warnings = payload.get("warnings") or metadata.get("warnings") or []
+    if (
+        warnings
+        and metadata.get("source") == "subtitle"
+        and not allow_suspicious_subtitle
+    ):
+        raise BilibiliError(
+            "Cached Bilibili subtitle is marked suspicious; refusing to return it "
+            "as reliable transcript. Re-run with force_asr=true after configuring "
+            "ASR, or set allow_suspicious_subtitle=true only if you explicitly "
+            f"want the cached raw subtitle. Warnings: {'; '.join(map(str, warnings))}"
+        )
 
 
 def _subtitle_quality_warnings(
-    segments: list[dict[str, Any]], duration: int | float
+    segments: list[dict[str, Any]],
+    duration: int | float,
+    *,
+    title: str = "",
+    part: str = "",
 ) -> list[str]:
     if not segments:
         return []
@@ -363,4 +805,34 @@ def _subtitle_quality_warnings(
             "Bilibili subtitle covers less than 65% of the video duration; "
             "it may be incomplete or mismatched. Use force_asr=true to verify."
         )
+    warnings.extend(_subtitle_topic_warnings(segments, title=title, part=part))
     return warnings
+
+
+def _subtitle_topic_warnings(
+    segments: list[dict[str, Any]], *, title: str = "", part: str = ""
+) -> list[str]:
+    grams = _cjk_bigrams(" ".join([title or "", part or ""]))
+    if len(grams) < 8:
+        return []
+    transcript_text = "".join(str(seg.get("text") or "") for seg in segments)
+    matched = [gram for gram in grams if gram in transcript_text]
+    if len(matched) <= max(1, len(grams) // 10):
+        return [
+            "Bilibili subtitle appears topic-mismatched with the video title; "
+            "title keywords barely appear in the transcript. Use force_asr=true "
+            "to verify against audio before analysis."
+        ]
+    return []
+
+
+def _cjk_bigrams(text: str) -> list[str]:
+    chars = re.findall(r"[\u4e00-\u9fff]", text or "")
+    seen: set[str] = set()
+    grams: list[str] = []
+    for i in range(len(chars) - 1):
+        gram = "".join(chars[i : i + 2])
+        if gram not in seen:
+            seen.add(gram)
+            grams.append(gram)
+    return grams
