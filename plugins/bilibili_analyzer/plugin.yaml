@@ -1,0 +1,8 @@
+name: bilibili_analyzer
+version: 0.1.0
+description: "Analyze Bilibili videos from subtitles or ASR."
+author: Hermes Agent
+kind: standalone
+provides_tools:
+  - bilibili_fetch_transcript
+  - bilibili_analyze_video

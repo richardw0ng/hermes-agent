@@ -1,0 +1,105 @@
+# Bilibili Analyzer
+
+Hermes plugin for analyzing Bilibili videos from subtitles or ASR.
+
+## Enable
+
+Add the plugin to `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - bilibili_analyzer
+```
+
+For Bilibili AI subtitles, add login cookies to `~/.hermes/.env`:
+
+```bash
+BILIBILI_SESSDATA=...
+BILIBILI_BUVID3=...
+```
+
+`SESSDATA` is a secret. Do not commit it.
+
+For private multi-machine checkouts, the plugin can also read a repo-local
+Python constants file:
+
+```text
+plugins/bilibili_analyzer/private_cookies.py
+```
+
+```python
+SESSDATA = "..."
+BUVID3 = "..."
+```
+
+The plugin also supports a repo-local cookie JSON file:
+
+```text
+.hermes/bilibili_cookies.json
+```
+
+```json
+{
+  "SESSDATA": "...",
+  "BUVID3": "..."
+}
+```
+
+You may commit these only to a private repository whose access controls you
+trust. Environment variables still take precedence over repo-local files. To use
+a different JSON path, set:
+
+```bash
+BILIBILI_COOKIE_FILE=D:\path\to\bilibili_cookies.json
+```
+
+## ASR Fallback
+
+The plugin uses subtitles first. If no subtitle is available, it downloads the
+audio with `yt-dlp` and runs ASR.
+
+Supported ASR modes:
+
+- `faster_whisper`: install `faster-whisper` and set optional model env vars.
+- `command`: set `BILIBILI_ASR_COMMAND` to any local command that prints JSON
+  or plain text.
+
+Example command adapter:
+
+```bash
+BILIBILI_ASR_COMMAND="python aliyun_asr.py {audio_path}"
+```
+
+The command should print either:
+
+```json
+{"segments":[{"start":0,"end":12,"text":"..."}]}
+```
+
+or:
+
+```json
+[{"from":0,"to":12,"content":"..."}]
+```
+
+Plain text is also accepted, but timestamps will be lost.
+
+## Tools
+
+- `bilibili_fetch_transcript`: returns metadata and timestamped transcript
+  segments.
+- `bilibili_analyze_video`: fetches the transcript, chunks long videos, asks the
+  host LLM for chunk notes, then produces a global viewpoint analysis.
+
+Example prompt:
+
+```text
+用 bilibili_analyze_video 分析 BVxxxx，输出 markdown，重点提炼 UP 主观点、论据、争议点和时间戳。
+```
+
+Cached transcripts are stored under:
+
+```text
+<HERMES_HOME>/cache/bilibili_analyzer/
+```
