@@ -97,6 +97,10 @@ Plain text is also accepted, but timestamps will be lost.
   segments.
 - `bilibili_analyze_video`: fetches the transcript, chunks long videos, asks the
   host LLM for chunk notes, then produces a global viewpoint analysis.
+- `bilibili_fetch_comments`: fetches and filters high-information comments.
+- `bilibili_analyze_following_group_latest`: reads your authenticated Bilibili
+  follow groups, selects a group such as `投资`, fetches each creator's latest
+  videos, analyzes them, and writes a batch archive with an `index.md`.
 
 Example prompt:
 
@@ -108,4 +112,16 @@ Cached transcripts are stored under:
 
 ```text
 <HERMES_HOME>/cache/bilibili_analyzer/
+```
+
+Batch follow-group analysis writes to:
+
+```text
+outputs/bilibili_analyzer/following/<timestamp>_<group>/
+```
+
+Example prompt:
+
+```text
+用 bilibili_analyze_following_group_latest 分析我关注列表里“投资”分组的博主，每个博主最新 10 条视频，归档到本地。
 ```

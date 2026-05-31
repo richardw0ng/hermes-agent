@@ -1,6 +1,7 @@
 import json
 import builtins
 import types
+from types import SimpleNamespace
 
 from plugins.bilibili_analyzer import analysis
 from plugins.bilibili_analyzer import asr
@@ -649,6 +650,127 @@ def test_analyze_handler_can_disable_auto_archive(monkeypatch, tmp_path):
     assert not (tmp_path / "outputs" / "bilibili_analyzer").exists()
 
 
+def test_analyze_handler_archives_partial_when_analysis_fails(monkeypatch, tmp_path):
+    output_path = tmp_path / "failed.md"
+    transcript = {
+        "metadata": {
+            "bvid": "BV1xx411c7mD",
+            "cid": 123,
+            "title": "Partial Title",
+            "owner": "UP",
+            "source": "asr:command",
+            "usable_for_analysis": True,
+        },
+        "segments": [{"start": 0, "end": 1, "text": "hello transcript"}],
+        "warnings": [],
+    }
+
+    monkeypatch.setattr(tools, "fetch_transcript", lambda *_args, **_kwargs: transcript)
+
+    def fail_analysis(*_args, **_kwargs):
+        raise RuntimeError("Connection error")
+
+    monkeypatch.setattr(tools, "analyze_transcript", fail_analysis)
+    handler = tools.make_analyze_handler(object())
+    result = json.loads(
+        handler(
+            {
+                "url_or_bvid": "BV1xx411c7mD",
+                "output_path": str(output_path),
+            }
+        )
+    )
+
+    partial_path = tmp_path / "failed_partial.md"
+    assert result["success"] is False
+    assert result["stage"] == "analyze"
+    assert result["partial_archive"] is True
+    assert result["output_path"] == str(partial_path)
+    text = partial_path.read_text(encoding="utf-8")
+    assert "Connection error" in text
+    assert "hello transcript" in text
+
+
+def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
+    class FakeLLM:
+        def complete(self, **_kwargs):
+            return SimpleNamespace(text="chunk note")
+
+        def complete_structured(self, **_kwargs):
+            return SimpleNamespace(
+                parsed={
+                    "video": {"title": "测试视频", "owner": "财经UP", "theme": "宏观"},
+                    "main_thesis": "测试主旨",
+                    "viewpoints": [
+                        {
+                            "claim": "测试观点",
+                            "evidence": "测试论据",
+                            "timestamps": ["00:00:01"],
+                        }
+                    ],
+                    "opposing_or_controversial_points": [],
+                    "key_facts": [],
+                    "summary": "测试总结",
+                },
+                text="",
+            )
+
+    monkeypatch.setattr(
+        tools,
+        "fetch_follow_group_users",
+        lambda **_kwargs: {
+            "group": {"tagid": 123, "name": "财经", "count": 1},
+            "groups": [],
+            "users": [{"mid": 42, "name": "财经UP"}],
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_user_latest_videos",
+        lambda *_args, **_kwargs: [
+            {
+                "bvid": "BV1xx411c7mD",
+                "title": "测试视频",
+                "created": 1760000000,
+                "author": "财经UP",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_transcript",
+        lambda url_or_bvid, **_kwargs: {
+            "metadata": {
+                "bvid": url_or_bvid,
+                "cid": 1,
+                "page": 1,
+                "title": "测试视频",
+                "owner": "财经UP",
+                "duration": 5,
+                "source": "subtitle",
+                "usable_for_analysis": True,
+            },
+            "segments": [{"start": 0, "end": 5, "text": "这是测试文稿"}],
+            "warnings": [],
+            "cache_hit": False,
+        },
+    )
+
+    result = tools.analyze_following_group_latest(
+        FakeLLM(),
+        output_dir=str(tmp_path),
+        per_up_limit=10,
+    )
+
+    assert result["analyzed_count"] == 1
+    assert result["failure_count"] == 0
+    index_path = tmp_path / "index.md"
+    assert result["index_path"] == str(index_path)
+    assert index_path.exists()
+    assert "测试视频" in index_path.read_text(encoding="utf-8")
+    assert len(list(tmp_path.glob("*.md"))) == 2
+
+
 def test_plugin_registers_tools():
     from plugins.bilibili_analyzer import register
 
@@ -666,5 +788,6 @@ def test_plugin_registers_tools():
         "bilibili_fetch_transcript",
         "bilibili_analyze_video",
         "bilibili_fetch_comments",
+        "bilibili_analyze_following_group_latest",
     }
     assert all(item["toolset"] == "bilibili" for item in registered)

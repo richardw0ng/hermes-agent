@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -25,6 +26,18 @@ USER_AGENT = (
 
 class BilibiliError(RuntimeError):
     pass
+
+
+_WBI_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32,
+    15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61,
+    26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63,
+    57, 62, 11, 36, 20, 34, 44, 52,
+]
 
 
 def cache_dir() -> Path:
@@ -150,6 +163,185 @@ def _get_json(url: str) -> dict[str, Any]:
         raise BilibiliError(f"Bilibili HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise BilibiliError(f"Bilibili request failed: {exc}") from exc
+
+
+def fetch_nav_info() -> dict[str, Any]:
+    payload = _get_json("https://api.bilibili.com/x/web-interface/nav")
+    if payload.get("code") != 0:
+        raise BilibiliError(payload.get("message") or "Could not fetch Bilibili nav info.")
+    return payload.get("data") or {}
+
+
+def fetch_follow_groups() -> list[dict[str, Any]]:
+    payload = _get_json("https://api.bilibili.com/x/relation/tags")
+    if payload.get("code") != 0:
+        raise BilibiliError(payload.get("message") or "Could not fetch follow groups.")
+    groups = payload.get("data") or []
+    return [
+        {
+            "tagid": int(item.get("tagid") or 0),
+            "name": str(item.get("name") or ""),
+            "count": int(item.get("count") or 0),
+        }
+        for item in groups
+        if isinstance(item, dict)
+    ]
+
+
+def fetch_follow_group_users(
+    group_name: str = "投资",
+    *,
+    tagid: int | None = None,
+    max_users: int = 0,
+) -> dict[str, Any]:
+    groups = fetch_follow_groups()
+    selected = None
+    if tagid is not None:
+        selected = next((g for g in groups if int(g.get("tagid") or 0) == int(tagid)), None)
+    if selected is None:
+        selected = next((g for g in groups if str(g.get("name") or "") == group_name), None)
+    if selected is None:
+        names = ", ".join(str(g.get("name") or "") for g in groups)
+        raise BilibiliError(f"Follow group not found: {group_name}. Available groups: {names}")
+
+    selected_tagid = int(selected.get("tagid") or 0)
+    users: list[dict[str, Any]] = []
+    pn = 1
+    ps = 50
+    while True:
+        query = urllib.parse.urlencode(
+            {"tagid": selected_tagid, "pn": pn, "ps": ps, "order_type": "attention"}
+        )
+        payload = _get_json(f"https://api.bilibili.com/x/relation/tag?{query}")
+        if payload.get("code") != 0:
+            raise BilibiliError(payload.get("message") or "Could not fetch follow group users.")
+        data = payload.get("data") or []
+        page_users = [_normalize_follow_user(item) for item in data if isinstance(item, dict)]
+        page_users = [item for item in page_users if item]
+        users.extend(page_users)
+        if max_users > 0 and len(users) >= max_users:
+            users = users[:max_users]
+            break
+        if len(page_users) < ps:
+            break
+        pn += 1
+    return {"group": selected, "groups": groups, "users": users}
+
+
+def _normalize_follow_user(item: dict[str, Any]) -> dict[str, Any] | None:
+    mid = item.get("mid") or item.get("fid") or item.get("vmid")
+    try:
+        mid_int = int(mid)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "mid": mid_int,
+        "name": str(item.get("uname") or item.get("name") or ""),
+        "sign": str(item.get("sign") or ""),
+        "official_verify": item.get("official_verify") or {},
+        "mtime": int(item.get("mtime") or 0),
+    }
+
+
+def fetch_user_latest_videos(mid: int | str, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Fetch a user's latest archive videos.
+
+    Bilibili's space archive endpoint has gradually moved behind WBI signing.
+    Try the older unsigned endpoint first for compatibility, then fall back to
+    the signed endpoint using keys from the logged-in nav response.
+    """
+    limit = min(50, max(1, int(limit or 10)))
+    params = {
+        "mid": int(mid),
+        "pn": 1,
+        "ps": limit,
+        "tid": 0,
+        "keyword": "",
+        "order": "pubdate",
+        "platform": "web",
+    }
+    query = urllib.parse.urlencode(params)
+    first_error = ""
+    try:
+        payload = _get_json(f"https://api.bilibili.com/x/space/arc/search?{query}")
+        return _videos_from_space_payload(payload)
+    except Exception as exc:
+        first_error = str(exc)
+
+    signed = _sign_wbi_params(params)
+    signed_query = urllib.parse.urlencode(signed)
+    try:
+        payload = _get_json(f"https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}")
+        return _videos_from_space_payload(payload)
+    except Exception as exc:
+        raise BilibiliError(
+            f"Could not fetch latest videos for mid={mid}. "
+            f"unsigned endpoint: {first_error}; signed endpoint: {exc}"
+        ) from exc
+
+
+def _videos_from_space_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("code") != 0:
+        raise BilibiliError(payload.get("message") or "Could not fetch user videos.")
+    data = payload.get("data") or {}
+    vlist = (((data.get("list") or {}).get("vlist")) or data.get("vlist") or [])
+    videos = []
+    for item in vlist:
+        if not isinstance(item, dict):
+            continue
+        bvid = str(item.get("bvid") or "").strip()
+        if not bvid:
+            continue
+        videos.append(
+            {
+                "bvid": bvid,
+                "aid": item.get("aid"),
+                "title": str(item.get("title") or ""),
+                "description": str(item.get("description") or ""),
+                "created": int(item.get("created") or item.get("pubdate") or 0),
+                "length": str(item.get("length") or ""),
+                "play": int(item.get("play") or 0),
+                "comment": int(item.get("comment") or 0),
+                "favorites": int(item.get("favorites") or 0),
+                "author": str(item.get("author") or ""),
+                "mid": item.get("mid"),
+            }
+        )
+    return videos
+
+
+def _sign_wbi_params(params: dict[str, Any]) -> dict[str, Any]:
+    nav = fetch_nav_info()
+    wbi_img = nav.get("wbi_img") or {}
+    img_key = _wbi_key_part(str(wbi_img.get("img_url") or ""))
+    sub_key = _wbi_key_part(str(wbi_img.get("sub_url") or ""))
+    if not img_key or not sub_key:
+        raise BilibiliError("Could not resolve WBI signing keys from Bilibili nav info.")
+    mixin_key = _wbi_mixin_key(img_key + sub_key)
+    signed = dict(params)
+    signed["wts"] = int(time.time())
+    encoded = urllib.parse.urlencode(
+        sorted(
+            (k, _sanitize_wbi_value(v)) for k, v in signed.items()
+            if v is not None
+        )
+    )
+    signed["w_rid"] = hashlib.md5((encoded + mixin_key).encode("utf-8")).hexdigest()
+    return signed
+
+
+def _wbi_key_part(url: str) -> str:
+    filename = urllib.parse.urlparse(url).path.rsplit("/", 1)[-1]
+    return filename.split(".", 1)[0]
+
+
+def _wbi_mixin_key(raw: str) -> str:
+    return "".join(raw[i] for i in _WBI_MIXIN_KEY_ENC_TAB if i < len(raw))[:32]
+
+
+def _sanitize_wbi_value(value: Any) -> str:
+    text = str(value)
+    return re.sub(r"[!'()*]", "", text)
 
 
 def fetch_video_info(bvid: str) -> dict[str, Any]:

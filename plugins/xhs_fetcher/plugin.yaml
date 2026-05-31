@@ -1,0 +1,10 @@
+name: xhs_fetcher
+version: 0.1.0
+description: "Fetch Xiaohongshu notes via xhs-kit."
+author: Hermes Agent
+kind: standalone
+provides_tools:
+  - xhs_check_status
+  - xhs_search_notes
+  - xhs_fetch_note
+  - xhs_fetch_comments

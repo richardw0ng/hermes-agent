@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +16,12 @@ from .bilibili import (
     cache_dir,
     download_audio,
     extract_bvid,
+    fetch_follow_group_users,
     fetch_video_comments,
     fetch_subtitle_segments,
     fetch_subtitle_segments_ytdlp,
     fetch_video_info,
+    fetch_user_latest_videos,
     load_cached_comments,
     load_cached_transcript,
     load_cached_transcript_for_page,
@@ -226,6 +229,111 @@ BILI_FETCH_COMMENTS_SCHEMA = {
     },
 }
 
+BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA = {
+    "name": "bilibili_analyze_following_group_latest",
+    "description": (
+        "Analyze and archive the latest videos from Bilibili creators in one "
+        "of the authenticated user's follow groups, such as 投资."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_name": {
+                "type": "string",
+                "description": "Follow group name. Defaults to 投资.",
+                "default": "投资",
+            },
+            "tagid": {
+                "type": "integer",
+                "description": "Optional follow group tag id. Overrides group_name when set.",
+            },
+            "per_up_limit": {
+                "type": "integer",
+                "description": "Latest videos to fetch per followed creator. Defaults to 10.",
+                "default": 10,
+            },
+            "max_up": {
+                "type": "integer",
+                "description": "Maximum creators to process. 0 means all creators in the group.",
+                "default": 0,
+            },
+            "max_videos_total": {
+                "type": "integer",
+                "description": "Maximum total videos to analyze. 0 means no total cap.",
+                "default": 0,
+            },
+            "output_dir": {
+                "type": "string",
+                "description": (
+                    "Optional batch archive directory. If omitted, writes under "
+                    "outputs/bilibili_analyzer/following/<timestamp>_<group>."
+                ),
+            },
+            "chunk_minutes": {
+                "type": "integer",
+                "description": "Transcript chunk size for first-pass summaries.",
+                "default": 4,
+            },
+            "asr_provider": {
+                "type": "string",
+                "description": "ASR provider: auto, command, or faster_whisper.",
+                "default": "auto",
+            },
+            "force_asr": {
+                "type": "boolean",
+                "description": "Skip Bilibili subtitles and transcribe downloaded audio.",
+                "default": False,
+            },
+            "allow_suspicious_subtitle": {
+                "type": "boolean",
+                "description": "Analyze suspicious/incomplete subtitles anyway. Defaults to false.",
+                "default": False,
+            },
+            "include_comments": {
+                "type": "boolean",
+                "description": "Fetch and include high-information comments in each video analysis.",
+                "default": False,
+            },
+            "max_comments": {
+                "type": "integer",
+                "description": "Maximum raw comments to fetch when include_comments is true.",
+                "default": 200,
+            },
+            "comment_limit": {
+                "type": "integer",
+                "description": "Maximum filtered comments to pass into each analysis.",
+                "default": 30,
+            },
+            "include_comment_replies": {
+                "type": "boolean",
+                "description": "Fetch a small number of nested replies for comment analysis.",
+                "default": False,
+            },
+            "comment_sort": {
+                "type": "string",
+                "description": "Comment sort: hot or time. Defaults to hot.",
+                "default": "hot",
+            },
+            "use_cache": {
+                "type": "boolean",
+                "description": "Reuse cached transcripts/comments. Defaults to true.",
+                "default": True,
+            },
+            "force_refresh": {
+                "type": "boolean",
+                "description": "Ignore cached transcripts/comments and fetch again.",
+                "default": False,
+            },
+            "continue_on_error": {
+                "type": "boolean",
+                "description": "Keep processing later videos if one video fails. Defaults to true.",
+                "default": True,
+            },
+        },
+        "required": [],
+    },
+}
+
 
 def check_requirements() -> bool:
     return True
@@ -289,6 +397,37 @@ def handle_fetch_comments(args: dict[str, Any], **_kwargs) -> str:
         return _json({"success": False, "error": str(exc)})
 
 
+def make_following_group_latest_handler(llm: Any):
+    def _handler(args: dict[str, Any], **_kwargs) -> str:
+        try:
+            payload = analyze_following_group_latest(
+                llm,
+                group_name=str(args.get("group_name") or "投资"),
+                tagid=args.get("tagid"),
+                per_up_limit=int(args.get("per_up_limit") or 10),
+                max_up=int(args.get("max_up") or 0),
+                max_videos_total=int(args.get("max_videos_total") or 0),
+                output_dir=str(args.get("output_dir") or ""),
+                chunk_minutes=int(args.get("chunk_minutes") or 4),
+                asr_provider=str(args.get("asr_provider") or "auto"),
+                force_asr=bool(args.get("force_asr", False)),
+                allow_suspicious_subtitle=bool(args.get("allow_suspicious_subtitle", False)),
+                include_comments=bool(args.get("include_comments", False)),
+                max_comments=int(args.get("max_comments") or 200),
+                comment_limit=int(args.get("comment_limit") or 30),
+                include_comment_replies=bool(args.get("include_comment_replies", False)),
+                comment_sort=str(args.get("comment_sort") or "hot"),
+                use_cache=bool(args.get("use_cache", True)),
+                force_refresh=bool(args.get("force_refresh", False)),
+                continue_on_error=bool(args.get("continue_on_error", True)),
+            )
+            return _json({"success": True, **payload})
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    return _handler
+
+
 def fetch_comments(
     url_or_bvid: str,
     *,
@@ -342,6 +481,139 @@ def fetch_comments(
     if use_cache:
         save_cached_comments(payload)
     return payload
+
+
+def analyze_following_group_latest(
+    llm: Any,
+    *,
+    group_name: str = "投资",
+    tagid: int | None = None,
+    per_up_limit: int = 10,
+    max_up: int = 0,
+    max_videos_total: int = 0,
+    output_dir: str = "",
+    chunk_minutes: int = 4,
+    asr_provider: str = "auto",
+    force_asr: bool = False,
+    allow_suspicious_subtitle: bool = False,
+    include_comments: bool = False,
+    max_comments: int = 200,
+    comment_limit: int = 30,
+    include_comment_replies: bool = False,
+    comment_sort: str = "hot",
+    use_cache: bool = True,
+    force_refresh: bool = False,
+    continue_on_error: bool = True,
+) -> dict[str, Any]:
+    per_up_limit = min(50, max(1, int(per_up_limit or 10)))
+    max_up = max(0, int(max_up or 0))
+    max_videos_total = max(0, int(max_videos_total or 0))
+    group_payload = fetch_follow_group_users(
+        group_name=group_name,
+        tagid=int(tagid) if tagid is not None else None,
+        max_users=max_up,
+    )
+    group = group_payload["group"]
+    users = group_payload["users"]
+    batch_dir = _following_batch_output_dir(output_dir, group_name=str(group.get("name") or group_name))
+    videos: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    processed = 0
+
+    for user in users:
+        try:
+            latest = fetch_user_latest_videos(int(user["mid"]), limit=per_up_limit)
+        except Exception as exc:
+            failure = {
+                "stage": "fetch_latest_videos",
+                "up": user,
+                "error": str(exc),
+            }
+            failures.append(failure)
+            if not continue_on_error:
+                break
+            continue
+        for video in latest[:per_up_limit]:
+            if max_videos_total and processed >= max_videos_total:
+                break
+            video["owner_mid"] = user["mid"]
+            video["owner_name"] = user.get("name") or video.get("author") or ""
+            videos.append(video)
+            output_path = batch_dir / _up_video_archive_filename(user, video)
+            args = {
+                "url_or_bvid": video["bvid"],
+                "page": 1,
+                "output_format": "markdown",
+                "chunk_minutes": chunk_minutes,
+                "asr_provider": asr_provider,
+                "use_cache": use_cache,
+                "force_refresh": force_refresh,
+                "force_asr": force_asr,
+                "allow_suspicious_subtitle": allow_suspicious_subtitle,
+                "persist_file": True,
+                "include_comments": include_comments,
+                "max_comments": max_comments,
+                "comment_limit": comment_limit,
+                "include_comment_replies": include_comment_replies,
+                "comment_sort": comment_sort,
+                "output_path": str(output_path),
+            }
+            raw = make_analyze_handler(llm)(args)
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                item = {"success": False, "error": raw}
+            item["up"] = user
+            item["video"] = video
+            if item.get("success"):
+                processed += 1
+                results.append(
+                    {
+                        "up": user,
+                        "video": video,
+                        "output_path": item.get("output_path") or str(output_path),
+                        "summary": ((item.get("analysis") or {}).get("summary") or ""),
+                        "main_thesis": ((item.get("analysis") or {}).get("main_thesis") or ""),
+                    }
+                )
+            else:
+                failures.append(
+                    {
+                        "stage": item.get("stage") or "analyze_video",
+                        "up": user,
+                        "video": video,
+                        "error": item.get("error") or "Unknown analysis failure.",
+                    }
+                )
+                if not continue_on_error:
+                    break
+        if max_videos_total and processed >= max_videos_total:
+            break
+        if failures and not continue_on_error:
+            break
+
+    index_path = _persist_following_batch_index(
+        batch_dir,
+        group=group,
+        users=users,
+        requested_per_up=per_up_limit,
+        videos=videos,
+        results=results,
+        failures=failures,
+    )
+    return {
+        "group": group,
+        "up_count": len(users),
+        "requested_per_up": per_up_limit,
+        "video_count": len(videos),
+        "analyzed_count": len(results),
+        "failure_count": len(failures),
+        "batch_dir": str(batch_dir),
+        "index_path": str(index_path),
+        "results": results,
+        "failures": failures,
+    }
 
 
 def fetch_transcript(
@@ -465,6 +737,7 @@ def make_analyze_handler(llm: Any):
         transcript: dict[str, Any] | None = None
         comments_payload: dict[str, Any] | None = None
         analysis: dict[str, Any] | None = None
+        output_path = ""
         try:
             transcript = fetch_transcript(
                 args.get("url_or_bvid") or "",
@@ -507,7 +780,6 @@ def make_analyze_handler(llm: Any):
                 output_format=str(args.get("output_format") or "markdown"),
                 chunk_minutes=int(args.get("chunk_minutes") or 4),
             )
-            output_path = ""
             if _bool_arg(args, "persist_file", True):
                 stage = "persist"
                 output_path = _persist_analysis(
@@ -525,6 +797,19 @@ def make_analyze_handler(llm: Any):
                 }
             )
         except Exception as exc:
+            partial_output_path = ""
+            if transcript and _bool_arg(args, "persist_file", True):
+                try:
+                    partial_output_path = _persist_partial_analysis(
+                        transcript,
+                        comments_payload=comments_payload,
+                        analysis=analysis,
+                        failed_stage=stage,
+                        error=str(exc),
+                        output_path=str(args.get("output_path") or output_path or ""),
+                    )
+                except Exception:
+                    partial_output_path = ""
             return _json(
                 {
                     "success": False,
@@ -533,6 +818,8 @@ def make_analyze_handler(llm: Any):
                     "transcript": transcript,
                     "comments": comments_payload,
                     "analysis": analysis,
+                    "output_path": partial_output_path,
+                    "partial_archive": bool(partial_output_path),
                 }
             )
 
@@ -710,6 +997,66 @@ def _persist_analysis(
     return str(path)
 
 
+def _persist_partial_analysis(
+    transcript: dict[str, Any],
+    *,
+    comments_payload: dict[str, Any] | None = None,
+    analysis: dict[str, Any] | None = None,
+    failed_stage: str = "",
+    error: str = "",
+    output_path: str = "",
+) -> str:
+    metadata = transcript.get("metadata") or {}
+    bvid = str(metadata.get("bvid") or "bilibili")
+    cid = str(metadata.get("cid") or "unknown")
+    title = str(metadata.get("title") or "")
+    path = _partial_archive_output_path(output_path, bvid=bvid, cid=cid, title=title)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# B站视频分析未完成归档",
+        "",
+        "## 失败信息",
+        "",
+        f"- 阶段：{failed_stage or 'unknown'}",
+        f"- 错误：{error}",
+        "",
+        "## 视频信息",
+        "",
+        f"- 标题：{title}",
+        f"- UP主：{metadata.get('owner', '')}",
+        f"- BV：{bvid}",
+        f"- CID：{cid}",
+        f"- 来源：{metadata.get('source', '')}",
+        f"- 时长：{metadata.get('duration', '')}",
+        "",
+    ]
+    warnings = transcript.get("warnings") or metadata.get("warnings") or []
+    if warnings:
+        lines.extend(["## 警告", ""])
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+    if analysis:
+        lines.extend(["## 部分分析结果", "", "```json"])
+        lines.append(json.dumps(analysis, ensure_ascii=False, indent=2))
+        lines.extend(["```", ""])
+    if comments_payload:
+        comments = comments_payload.get("comments") or []
+        lines.extend(["## 评论样本", ""])
+        for item in comments[:10]:
+            lines.append(f"- {item.get('message', '')}")
+        lines.append("")
+    lines.extend(["## Transcript", ""])
+    for seg in transcript.get("segments") or []:
+        lines.append(
+            f"- [{seg.get('start', 0):.2f}-{seg.get('end', 0):.2f}] {seg.get('text', '')}"
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(path)
+
+
 def _archive_output_path(output_path: str, *, bvid: str, cid: str, title: str = "") -> Path:
     if output_path:
         return _normalize_cross_platform_path(output_path)
@@ -717,6 +1064,13 @@ def _archive_output_path(output_path: str, *, bvid: str, cid: str, title: str = 
         part for part in (bvid, cid, _safe_filename_part(title)) if part
     )[:180]
     return _default_archive_dir() / f"{filename or bvid}_analysis.md"
+
+
+def _partial_archive_output_path(output_path: str, *, bvid: str, cid: str, title: str = "") -> Path:
+    path = _archive_output_path(output_path, bvid=bvid, cid=cid, title=title)
+    if path.suffix:
+        return path.with_name(f"{path.stem}_partial{path.suffix}")
+    return path.with_name(f"{path.name}_partial.md")
 
 
 def _default_archive_dir() -> Path:
@@ -754,6 +1108,91 @@ def _normalize_cross_platform_path(path_value: str) -> Path:
         rest = value[2:].lstrip("\\/").replace("\\", "/")
         return Path(f"/mnt/{drive}/{rest}")
     return Path(value).expanduser()
+
+
+def _following_batch_output_dir(output_dir: str, *, group_name: str) -> Path:
+    if output_dir:
+        path = _normalize_cross_platform_path(output_dir)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    group_part = _safe_filename_part(group_name, max_len=32) or "group"
+    path = _default_archive_dir() / "following" / f"{stamp}_{group_part}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _up_video_archive_filename(user: dict[str, Any], video: dict[str, Any]) -> str:
+    owner = _safe_filename_part(str(user.get("name") or video.get("owner_name") or "up"), 28)
+    created = int(video.get("created") or 0)
+    date_part = datetime.fromtimestamp(created).strftime("%Y%m%d") if created else "unknown-date"
+    bvid = str(video.get("bvid") or "video")
+    title = _safe_filename_part(str(video.get("title") or ""), 48)
+    return f"{owner}_{date_part}_{bvid}_{title or 'analysis'}.md"
+
+
+def _persist_following_batch_index(
+    batch_dir: Path,
+    *,
+    group: dict[str, Any],
+    users: list[dict[str, Any]],
+    requested_per_up: int,
+    videos: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+) -> Path:
+    path = batch_dir / "index.md"
+    lines = [
+        "# B站关注分组批量分析归档",
+        "",
+        f"- 分组：{group.get('name', '')}",
+        f"- tagid：{group.get('tagid', '')}",
+        f"- 关注博主数：{len(users)}",
+        f"- 每位博主请求最新视频数：{requested_per_up}",
+        f"- 获取视频数：{len(videos)}",
+        f"- 成功分析数：{len(results)}",
+        f"- 失败数：{len(failures)}",
+        f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## 成功归档",
+        "",
+    ]
+    if not results:
+        lines.append("- 暂无。")
+    for item in results:
+        up = item.get("up") or {}
+        video = item.get("video") or {}
+        output_path = str(item.get("output_path") or "")
+        try:
+            rel = Path(output_path).resolve().relative_to(batch_dir.resolve())
+            link = rel.as_posix()
+        except Exception:
+            link = output_path
+        created = int(video.get("created") or 0)
+        created_text = datetime.fromtimestamp(created).strftime("%Y-%m-%d") if created else ""
+        lines.append(
+            f"- [{video.get('title', '')}]({link}) "
+            f"｜UP：{up.get('name', '')}｜BV：{video.get('bvid', '')}｜{created_text}"
+        )
+        thesis = str(item.get("main_thesis") or item.get("summary") or "").strip()
+        if thesis:
+            lines.append(f"  - 摘要：{thesis[:240]}")
+
+    lines.extend(["", "## 失败记录", ""])
+    if not failures:
+        lines.append("- 无。")
+    for item in failures:
+        up = item.get("up") or {}
+        video = item.get("video") or {}
+        lines.append(
+            f"- 阶段：{item.get('stage', '')}｜UP：{up.get('name', '')}｜"
+            f"BV：{video.get('bvid', '')}｜错误：{item.get('error', '')}"
+        )
+
+    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return path
 
 
 def _safe_filename_part(value: str, max_len: int = 48) -> str:

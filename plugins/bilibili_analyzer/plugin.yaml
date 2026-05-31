@@ -6,3 +6,5 @@ kind: standalone
 provides_tools:
   - bilibili_fetch_transcript
   - bilibili_analyze_video
+  - bilibili_fetch_comments
+  - bilibili_analyze_following_group_latest

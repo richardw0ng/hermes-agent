@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from .tools import (
     BILI_ANALYZE_VIDEO_SCHEMA,
+    BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA,
     BILI_FETCH_COMMENTS_SCHEMA,
     BILI_FETCH_TRANSCRIPT_SCHEMA,
     check_requirements,
     handle_fetch_comments,
     handle_fetch_transcript,
     make_analyze_handler,
+    make_following_group_latest_handler,
 )
 
 
@@ -37,4 +39,12 @@ def register(ctx) -> None:
         handler=handle_fetch_comments,
         check_fn=check_requirements,
         emoji="评论",
+    )
+    ctx.register_tool(
+        name="bilibili_analyze_following_group_latest",
+        toolset="bilibili",
+        schema=BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA,
+        handler=make_following_group_latest_handler(ctx.llm),
+        check_fn=check_requirements,
+        emoji="财经",
     )
