@@ -24,6 +24,17 @@ USER_AGENT = (
 )
 
 
+class _QuietYtdlpLogger:
+    def debug(self, _msg: str) -> None:
+        return
+
+    def warning(self, _msg: str) -> None:
+        return
+
+    def error(self, _msg: str) -> None:
+        return
+
+
 class BilibiliError(RuntimeError):
     pass
 
@@ -760,11 +771,17 @@ def download_audio(
     if cid:
         url = f"{url}?p=1"
 
-    if cid and prefer_playurl:
+    playurl_error = ""
+    if cid:
         try:
             return download_audio_via_playurl(bvid, cid)
-        except Exception:
-            pass
+        except Exception as exc:
+            playurl_error = f"direct playurl failed: {exc}"
+            if prefer_playurl:
+                # Bailian/DashScope can consume the source URL sidecar when
+                # playurl succeeds. If playurl fails, yt-dlp is a last resort
+                # because Bilibili often returns 412 on webpage extraction.
+                pass
 
     ytdlp_error = ""
     try:
@@ -774,7 +791,9 @@ def download_audio(
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": outtmpl,
             "quiet": True,
+            "no_warnings": True,
             "noplaylist": True,
+            "logger": _QuietYtdlpLogger(),
         }
         cookiejar = _bilibili_cookiejar()
         if cookiejar:
@@ -812,14 +831,11 @@ def download_audio(
     matches = sorted(cache_dir().glob(f"{bvid}_{cid or 'audio'}.*"))
     audio = next((p for p in matches if p.suffix.lower() in {".m4a", ".mp3", ".wav", ".webm"}), None)
     if not audio and cid:
-        try:
-            audio = download_audio_via_playurl(bvid, cid)
-        except Exception as exc:
-            detail = f"; direct playurl fallback failed: {exc}"
-            raise BilibiliError(
-                (ytdlp_error or "Audio download completed but no audio file was found.")
-                + detail
-            ) from exc
+        detail = f"; {playurl_error}" if playurl_error else ""
+        raise BilibiliError(
+            (ytdlp_error or "Audio download completed but no audio file was found.")
+            + detail
+        )
     if not audio:
         raise BilibiliError(
             ytdlp_error or "Audio download completed but no audio file was found."

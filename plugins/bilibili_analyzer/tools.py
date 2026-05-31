@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -262,6 +263,14 @@ BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA = {
                 "description": "Maximum total videos to analyze. 0 means no total cap.",
                 "default": 0,
             },
+            "days_back": {
+                "type": "integer",
+                "description": (
+                    "Only analyze videos published within this many days. "
+                    "Defaults to 7 for weekly reports; 0 disables date filtering."
+                ),
+                "default": 7,
+            },
             "output_dir": {
                 "type": "string",
                 "description": (
@@ -328,6 +337,21 @@ BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA = {
                 "type": "boolean",
                 "description": "Keep processing later videos if one video fails. Defaults to true.",
                 "default": True,
+            },
+            "retry_attempts": {
+                "type": "integer",
+                "description": "Retry attempts for Bilibili API/video operations. Defaults to 3.",
+                "default": 3,
+            },
+            "request_delay_seconds": {
+                "type": "number",
+                "description": "Delay between videos to reduce Bilibili rate limiting. Defaults to 4.",
+                "default": 4,
+            },
+            "rate_limit_pause_seconds": {
+                "type": "number",
+                "description": "Extra pause after 412/rate-limit errors. Defaults to 60.",
+                "default": 60,
             },
         },
         "required": [],
@@ -407,6 +431,7 @@ def make_following_group_latest_handler(llm: Any):
                 per_up_limit=int(args.get("per_up_limit") or 10),
                 max_up=int(args.get("max_up") or 0),
                 max_videos_total=int(args.get("max_videos_total") or 0),
+                days_back=int(args.get("days_back") if args.get("days_back") is not None else 7),
                 output_dir=str(args.get("output_dir") or ""),
                 chunk_minutes=int(args.get("chunk_minutes") or 4),
                 asr_provider=str(args.get("asr_provider") or "auto"),
@@ -420,6 +445,9 @@ def make_following_group_latest_handler(llm: Any):
                 use_cache=bool(args.get("use_cache", True)),
                 force_refresh=bool(args.get("force_refresh", False)),
                 continue_on_error=bool(args.get("continue_on_error", True)),
+                retry_attempts=int(args.get("retry_attempts") or 3),
+                request_delay_seconds=float(args.get("request_delay_seconds") if args.get("request_delay_seconds") is not None else 4),
+                rate_limit_pause_seconds=float(args.get("rate_limit_pause_seconds") if args.get("rate_limit_pause_seconds") is not None else 60),
             )
             return _json({"success": True, **payload})
         except Exception as exc:
@@ -491,6 +519,7 @@ def analyze_following_group_latest(
     per_up_limit: int = 10,
     max_up: int = 0,
     max_videos_total: int = 0,
+    days_back: int = 7,
     output_dir: str = "",
     chunk_minutes: int = 4,
     asr_provider: str = "auto",
@@ -504,14 +533,26 @@ def analyze_following_group_latest(
     use_cache: bool = True,
     force_refresh: bool = False,
     continue_on_error: bool = True,
+    retry_attempts: int = 3,
+    request_delay_seconds: float = 4,
+    rate_limit_pause_seconds: float = 60,
 ) -> dict[str, Any]:
     per_up_limit = min(50, max(1, int(per_up_limit or 10)))
     max_up = max(0, int(max_up or 0))
     max_videos_total = max(0, int(max_videos_total or 0))
-    group_payload = fetch_follow_group_users(
-        group_name=group_name,
-        tagid=int(tagid) if tagid is not None else None,
-        max_users=max_up,
+    days_back = max(0, int(days_back or 0))
+    retry_attempts = max(1, int(retry_attempts or 3))
+    request_delay_seconds = max(0.0, float(request_delay_seconds or 0))
+    rate_limit_pause_seconds = max(0.0, float(rate_limit_pause_seconds or 0))
+    group_payload = _retry_bilibili_operation(
+        lambda: fetch_follow_group_users(
+            group_name=group_name,
+            tagid=int(tagid) if tagid is not None else None,
+            max_users=max_up,
+        ),
+        label=f"fetch_follow_group:{group_name}",
+        attempts=retry_attempts,
+        rate_limit_pause_seconds=rate_limit_pause_seconds,
     )
     group = group_payload["group"]
     users = group_payload["users"]
@@ -519,11 +560,18 @@ def analyze_following_group_latest(
     videos: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     processed = 0
+    latest_fetch_limit = min(50, max(per_up_limit, 30 if days_back else per_up_limit))
 
     for user in users:
         try:
-            latest = fetch_user_latest_videos(int(user["mid"]), limit=per_up_limit)
+            latest = _retry_bilibili_operation(
+                lambda user=user: fetch_user_latest_videos(int(user["mid"]), limit=latest_fetch_limit),
+                label=f"fetch_latest_videos:{user.get('name') or user.get('mid')}",
+                attempts=retry_attempts,
+                rate_limit_pause_seconds=rate_limit_pause_seconds,
+            )
         except Exception as exc:
             failure = {
                 "stage": "fetch_latest_videos",
@@ -534,7 +582,17 @@ def analyze_following_group_latest(
             if not continue_on_error:
                 break
             continue
-        for video in latest[:per_up_limit]:
+        selected_videos = _filter_recent_videos(latest, days_back=days_back)[:per_up_limit]
+        if not selected_videos:
+            skipped.append(
+                {
+                    "stage": "date_filter",
+                    "up": user,
+                    "reason": f"No videos within the last {days_back} days." if days_back else "No videos returned.",
+                }
+            )
+            continue
+        for video in selected_videos:
             if max_videos_total and processed >= max_videos_total:
                 break
             video["owner_mid"] = user["mid"]
@@ -559,7 +617,18 @@ def analyze_following_group_latest(
                 "comment_sort": comment_sort,
                 "output_path": str(output_path),
             }
-            raw = make_analyze_handler(llm)(args)
+            if videos or results or failures:
+                _sleep_between_bilibili_requests(request_delay_seconds)
+            try:
+                raw = _retry_bilibili_operation(
+                    lambda args=args: make_analyze_handler(llm)(args),
+                    label=f"analyze_video:{video.get('bvid')}",
+                    attempts=retry_attempts,
+                    rate_limit_pause_seconds=rate_limit_pause_seconds,
+                    retry_result_fn=_tool_result_is_retryable,
+                )
+            except Exception as exc:
+                raw = _json({"success": False, "stage": "analyze_video", "error": str(exc)})
             try:
                 item = json.loads(raw)
             except json.JSONDecodeError:
@@ -573,6 +642,7 @@ def analyze_following_group_latest(
                         "up": user,
                         "video": video,
                         "output_path": item.get("output_path") or str(output_path),
+                        "partial_archive": bool(item.get("partial_archive")),
                         "summary": ((item.get("analysis") or {}).get("summary") or ""),
                         "main_thesis": ((item.get("analysis") or {}).get("main_thesis") or ""),
                     }
@@ -584,6 +654,8 @@ def analyze_following_group_latest(
                         "up": user,
                         "video": video,
                         "error": item.get("error") or "Unknown analysis failure.",
+                        "output_path": item.get("output_path") or "",
+                        "partial_archive": bool(item.get("partial_archive")),
                     }
                 )
                 if not continue_on_error:
@@ -601,6 +673,7 @@ def analyze_following_group_latest(
         videos=videos,
         results=results,
         failures=failures,
+        skipped=skipped,
     )
     return {
         "group": group,
@@ -609,11 +682,94 @@ def analyze_following_group_latest(
         "video_count": len(videos),
         "analyzed_count": len(results),
         "failure_count": len(failures),
+        "skipped_count": len(skipped),
         "batch_dir": str(batch_dir),
         "index_path": str(index_path),
         "results": results,
         "failures": failures,
+        "skipped": skipped,
     }
+
+
+def _filter_recent_videos(
+    videos: list[dict[str, Any]], *, days_back: int = 7
+) -> list[dict[str, Any]]:
+    if days_back <= 0:
+        return list(videos)
+    try:
+        from hermes_time import now as _hermes_now
+
+        cutoff = int(_hermes_now().timestamp()) - days_back * 86400
+    except Exception:
+        cutoff = int(time.time()) - days_back * 86400
+    return [
+        video for video in videos
+        if int(video.get("created") or 0) >= cutoff
+    ]
+
+
+def _retry_bilibili_operation(
+    fn,
+    *,
+    label: str,
+    attempts: int = 3,
+    rate_limit_pause_seconds: float = 60,
+    retry_result_fn=None,
+):
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, int(attempts or 1)) + 1):
+        try:
+            result = fn()
+            if retry_result_fn and retry_result_fn(result):
+                raise BilibiliError(_retryable_result_error(result))
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            message = str(exc)
+            if _looks_like_bilibili_rate_limit(message):
+                delay = rate_limit_pause_seconds
+            else:
+                delay = min(30.0, 2.0 * attempt)
+            if delay > 0:
+                time.sleep(delay)
+    raise last_error or BilibiliError(f"{label} failed")
+
+
+def _tool_result_is_retryable(raw: str) -> bool:
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return False
+    if payload.get("success", True):
+        return False
+    return _looks_like_bilibili_rate_limit(str(payload.get("error") or ""))
+
+
+def _retryable_result_error(raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return "Retryable tool failure."
+    return str(payload.get("error") or "Retryable tool failure.")
+
+
+def _looks_like_bilibili_rate_limit(message: str) -> bool:
+    text = (message or "").lower()
+    return (
+        "412" in text
+        or "precondition failed" in text
+        or "请求过于频繁" in text
+        or "too frequent" in text
+        or "connection reset" in text
+        or "unexpected_eof" in text
+    )
+
+
+def _sleep_between_bilibili_requests(delay_seconds: float) -> None:
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
 
 
 def fetch_transcript(
@@ -1142,7 +1298,9 @@ def _persist_following_batch_index(
     videos: list[dict[str, Any]],
     results: list[dict[str, Any]],
     failures: list[dict[str, Any]],
+    skipped: list[dict[str, Any]] | None = None,
 ) -> Path:
+    skipped = skipped or []
     path = batch_dir / "index.md"
     lines = [
         "# B站关注分组批量分析归档",
@@ -1154,6 +1312,7 @@ def _persist_following_batch_index(
         f"- 获取视频数：{len(videos)}",
         f"- 成功分析数：{len(results)}",
         f"- 失败数：{len(failures)}",
+        f"- 跳过数：{len(skipped)}",
         f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
         "",
         "## 成功归档",
@@ -1176,9 +1335,21 @@ def _persist_following_batch_index(
             f"- [{video.get('title', '')}]({link}) "
             f"｜UP：{up.get('name', '')}｜BV：{video.get('bvid', '')}｜{created_text}"
         )
+        if item.get("partial_archive"):
+            lines.append("  - 状态：部分归档")
         thesis = str(item.get("main_thesis") or item.get("summary") or "").strip()
         if thesis:
             lines.append(f"  - 摘要：{thesis[:240]}")
+
+    lines.extend(["", "## 跳过记录", ""])
+    if not skipped:
+        lines.append("- 无。")
+    for item in skipped:
+        up = item.get("up") or {}
+        lines.append(
+            f"- 阶段：{item.get('stage', '')}｜UP：{up.get('name', '')}｜"
+            f"原因：{item.get('reason', '')}"
+        )
 
     lines.extend(["", "## 失败记录", ""])
     if not failures:
@@ -1186,9 +1357,19 @@ def _persist_following_batch_index(
     for item in failures:
         up = item.get("up") or {}
         video = item.get("video") or {}
+        output_path = str(item.get("output_path") or "")
+        suffix = ""
+        if output_path:
+            try:
+                rel = Path(output_path).resolve().relative_to(batch_dir.resolve())
+                suffix = f"｜归档：{rel.as_posix()}"
+            except Exception:
+                suffix = f"｜归档：{output_path}"
+        partial = "｜部分归档" if item.get("partial_archive") else ""
         lines.append(
             f"- 阶段：{item.get('stage', '')}｜UP：{up.get('name', '')}｜"
             f"BV：{video.get('bvid', '')}｜错误：{item.get('error', '')}"
+            f"{partial}{suffix}"
         )
 
     path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")

@@ -760,6 +760,7 @@ def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
         FakeLLM(),
         output_dir=str(tmp_path),
         per_up_limit=10,
+        days_back=0,
     )
 
     assert result["analyzed_count"] == 1
