@@ -1,4 +1,4 @@
-"""Hermes tool entrypoints for the Bilibili analyzer plugin."""
+﻿"""Hermes tool entrypoints for the Bilibili analyzer plugin."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .analysis import analyze_transcript
+from .analysis import analyze_transcript, transcript_to_text
 from .asr import has_asr_provider, transcribe_audio
 from .bilibili import (
     BilibiliError,
@@ -234,15 +234,15 @@ BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA = {
     "name": "bilibili_analyze_following_group_latest",
     "description": (
         "Analyze and archive the latest videos from Bilibili creators in one "
-        "of the authenticated user's follow groups, such as 投资."
+        "of the authenticated user's follow groups, such as 鎶曡祫."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "group_name": {
                 "type": "string",
-                "description": "Follow group name. Defaults to 投资.",
-                "default": "投资",
+                "description": "Follow group name. Defaults to 鎶曡祫.",
+                "default": "鎶曡祫",
             },
             "tagid": {
                 "type": "integer",
@@ -426,7 +426,7 @@ def make_following_group_latest_handler(llm: Any):
         try:
             payload = analyze_following_group_latest(
                 llm,
-                group_name=str(args.get("group_name") or "投资"),
+                group_name=str(args.get("group_name") or "鎶曡祫"),
                 tagid=args.get("tagid"),
                 per_up_limit=int(args.get("per_up_limit") or 10),
                 max_up=int(args.get("max_up") or 0),
@@ -514,7 +514,7 @@ def fetch_comments(
 def analyze_following_group_latest(
     llm: Any,
     *,
-    group_name: str = "投资",
+    group_name: str = "鎶曡祫",
     tagid: int | None = None,
     per_up_limit: int = 10,
     max_up: int = 0,
@@ -760,7 +760,7 @@ def _looks_like_bilibili_rate_limit(message: str) -> bool:
     return (
         "412" in text
         or "precondition failed" in text
-        or "请求过于频繁" in text
+        or "璇锋眰杩囦簬棰戠箒" in text
         or "too frequent" in text
         or "connection reset" in text
         or "unexpected_eof" in text
@@ -894,6 +894,7 @@ def make_analyze_handler(llm: Any):
         comments_payload: dict[str, Any] | None = None
         analysis: dict[str, Any] | None = None
         output_path = ""
+        state_path = ""
         try:
             transcript = fetch_transcript(
                 args.get("url_or_bvid") or "",
@@ -909,6 +910,23 @@ def make_analyze_handler(llm: Any):
                 raise BilibiliError(
                     "Transcript is marked unusable for analysis. Re-run with force_asr=true "
                     "or explicitly set allow_suspicious_subtitle=true."
+                )
+            if _bool_arg(args, "persist_file", True):
+                output_path = _write_partial_archive(
+                    transcript,
+                    comments_payload,
+                    analysis,
+                    stage="transcript_ready",
+                    status="partial",
+                    output_path=str(args.get("output_path") or ""),
+                )
+                state_path = _write_archive_state(
+                    transcript,
+                    comments_payload,
+                    analysis,
+                    stage="transcript_ready",
+                    status="partial",
+                    output_path=output_path,
                 )
             comments_for_analysis = None
             if bool(args.get("include_comments", False)):
@@ -927,6 +945,23 @@ def make_analyze_handler(llm: Any):
                     limit=int(args.get("comment_limit") or 30),
                 )
                 comments_payload["analysis_comment_count"] = len(comments_for_analysis)
+                if _bool_arg(args, "persist_file", True):
+                    output_path = _write_partial_archive(
+                        transcript,
+                        comments_payload,
+                        analysis,
+                        stage="comments_ready",
+                        status="partial",
+                        output_path=output_path or str(args.get("output_path") or ""),
+                    )
+                    state_path = _write_archive_state(
+                        transcript,
+                        comments_payload,
+                        analysis,
+                        stage="comments_ready",
+                        status="partial",
+                        output_path=output_path,
+                    )
             stage = "analyze"
             analysis = analyze_transcript(
                 llm,
@@ -943,6 +978,14 @@ def make_analyze_handler(llm: Any):
                     analysis,
                     str(args.get("output_path") or ""),
                 )
+                state_path = _write_archive_state(
+                    transcript,
+                    comments_payload,
+                    analysis,
+                    stage="complete",
+                    status="complete",
+                    output_path=output_path,
+                )
             return _json(
                 {
                     "success": True,
@@ -950,22 +993,33 @@ def make_analyze_handler(llm: Any):
                     "comments": comments_payload,
                     "analysis": analysis,
                     "output_path": output_path,
+                    "state_path": state_path,
+                    "partial_archive": False,
                 }
             )
         except Exception as exc:
-            partial_output_path = ""
             if transcript and _bool_arg(args, "persist_file", True):
                 try:
-                    partial_output_path = _persist_partial_analysis(
+                    output_path = _write_partial_archive(
                         transcript,
-                        comments_payload=comments_payload,
-                        analysis=analysis,
-                        failed_stage=stage,
+                        comments_payload,
+                        analysis,
+                        stage=stage,
+                        status="failed",
                         error=str(exc),
-                        output_path=str(args.get("output_path") or output_path or ""),
+                        output_path=output_path or str(args.get("output_path") or ""),
+                    )
+                    state_path = _write_archive_state(
+                        transcript,
+                        comments_payload,
+                        analysis,
+                        stage=stage,
+                        status="failed",
+                        error=str(exc),
+                        output_path=output_path,
                     )
                 except Exception:
-                    partial_output_path = ""
+                    pass
             return _json(
                 {
                     "success": False,
@@ -974,8 +1028,9 @@ def make_analyze_handler(llm: Any):
                     "transcript": transcript,
                     "comments": comments_payload,
                     "analysis": analysis,
-                    "output_path": partial_output_path,
-                    "partial_archive": bool(partial_output_path),
+                    "output_path": output_path,
+                    "state_path": state_path,
+                    "partial_archive": bool(output_path),
                 }
             )
 
@@ -1153,64 +1208,118 @@ def _persist_analysis(
     return str(path)
 
 
-def _persist_partial_analysis(
+def _write_partial_archive(
     transcript: dict[str, Any],
+    comments: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
     *,
-    comments_payload: dict[str, Any] | None = None,
-    analysis: dict[str, Any] | None = None,
-    failed_stage: str = "",
-    error: str = "",
+    stage: str,
+    status: str,
     output_path: str = "",
+    error: str = "",
 ) -> str:
     metadata = transcript.get("metadata") or {}
     bvid = str(metadata.get("bvid") or "bilibili")
     cid = str(metadata.get("cid") or "unknown")
-    title = str(metadata.get("title") or "")
-    path = _partial_archive_output_path(output_path, bvid=bvid, cid=cid, title=title)
+    path = _archive_output_path(output_path, bvid=bvid, cid=cid, title=str(metadata.get("title") or ""))
     if not path.is_absolute():
         path = Path.cwd() / path
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "# B站视频分析未完成归档",
-        "",
-        "## 失败信息",
-        "",
-        f"- 阶段：{failed_stage or 'unknown'}",
-        f"- 错误：{error}",
-        "",
-        "## 视频信息",
-        "",
-        f"- 标题：{title}",
-        f"- UP主：{metadata.get('owner', '')}",
-        f"- BV：{bvid}",
-        f"- CID：{cid}",
-        f"- 来源：{metadata.get('source', '')}",
-        f"- 时长：{metadata.get('duration', '')}",
-        "",
-    ]
-    warnings = transcript.get("warnings") or metadata.get("warnings") or []
-    if warnings:
-        lines.extend(["## 警告", ""])
-        for warning in warnings:
-            lines.append(f"- {warning}")
-        lines.append("")
-    if analysis:
-        lines.extend(["## 部分分析结果", "", "```json"])
-        lines.append(json.dumps(analysis, ensure_ascii=False, indent=2))
-        lines.extend(["```", ""])
-    if comments_payload:
-        comments = comments_payload.get("comments") or []
-        lines.extend(["## 评论样本", ""])
-        for item in comments[:10]:
-            lines.append(f"- {item.get('message', '')}")
-        lines.append("")
-    lines.extend(["## Transcript", ""])
-    for seg in transcript.get("segments") or []:
-        lines.append(
-            f"- [{seg.get('start', 0):.2f}-{seg.get('end', 0):.2f}] {seg.get('text', '')}"
-        )
+    lines = _partial_archive_lines(
+        transcript,
+        comments,
+        analysis,
+        stage=stage,
+        status=status,
+        error=error,
+    )
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return str(path)
+
+
+def _write_archive_state(
+    transcript: dict[str, Any],
+    comments: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+    *,
+    stage: str,
+    status: str,
+    output_path: str,
+    error: str = "",
+) -> str:
+    metadata = transcript.get("metadata") or {}
+    bvid = str(metadata.get("bvid") or "bilibili")
+    cid = str(metadata.get("cid") or "unknown")
+    path = _archive_output_path(output_path, bvid=bvid, cid=cid, title=str(metadata.get("title") or ""))
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    state_path = path.with_suffix(".run.json")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "status": status,
+        "stage": stage,
+        "error": error,
+        "output_path": str(path),
+        "metadata": metadata,
+        "comment_metadata": (comments or {}).get("metadata") if comments else None,
+        "analysis_available": bool(analysis),
+        "transcript_segment_count": len(transcript.get("segments") or []),
+        "comment_count": len((comments or {}).get("comments") or []),
+    }
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(state_path)
+
+
+def _partial_archive_lines(
+    transcript: dict[str, Any],
+    comments: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+    *,
+    stage: str,
+    status: str,
+    error: str = "",
+) -> list[str]:
+    metadata = transcript.get("metadata") or {}
+    comments_items = (comments or {}).get("comments") or []
+    lines = [
+        "# Bilibili Video Analysis",
+        "",
+        f"- Status: {status}",
+        f"- Stage: {stage}",
+        f"- BV: {metadata.get('bvid', '')}",
+        f"- CID: {metadata.get('cid', '')}",
+        f"- Title: {metadata.get('title', '')}",
+        f"- Owner: {metadata.get('owner', '')}",
+        f"- Source: {metadata.get('source', '')}",
+    ]
+    if error:
+        lines.extend(["", "## Error", "", error])
+    if analysis:
+        markdown = analysis.get("markdown")
+        if markdown:
+            lines.extend(["", markdown.strip()])
+        else:
+            lines.extend(["", "## Analysis JSON", "", "```json", json.dumps(analysis, ensure_ascii=False, indent=2), "```"])
+    else:
+        lines.extend(
+            [
+                "",
+                "## Analysis",
+                "",
+                "Analysis has not completed yet. Transcript and comments below were archived for recovery.",
+            ]
+        )
+    if comments_items:
+        lines.extend(["", "## Filtered Comments", ""])
+        for item in comments_items[:20]:
+            like = int(item.get("like") or 0)
+            reply_count = int(item.get("reply_count") or 0)
+            lines.append(
+                f"- {item.get('message', '')} "
+                f"(user={item.get('user', '')}, like={like}, replies={reply_count})"
+            )
+    lines.extend(["", "## Transcript", "", transcript_to_text(transcript.get("segments") or [])])
+    return lines
 
 
 def _archive_output_path(output_path: str, *, bvid: str, cid: str, title: str = "") -> Path:
@@ -1303,23 +1412,23 @@ def _persist_following_batch_index(
     skipped = skipped or []
     path = batch_dir / "index.md"
     lines = [
-        "# B站关注分组批量分析归档",
+        "# Bilibili Follow Group Batch Analysis",
         "",
-        f"- 分组：{group.get('name', '')}",
-        f"- tagid：{group.get('tagid', '')}",
-        f"- 关注博主数：{len(users)}",
-        f"- 每位博主请求最新视频数：{requested_per_up}",
-        f"- 获取视频数：{len(videos)}",
-        f"- 成功分析数：{len(results)}",
-        f"- 失败数：{len(failures)}",
-        f"- 跳过数：{len(skipped)}",
-        f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"- Group: {group.get('name', '')}",
+        f"- tagid: {group.get('tagid', '')}",
+        f"- Followed UP count: {len(users)}",
+        f"- Requested videos per UP: {requested_per_up}",
+        f"- Videos fetched: {len(videos)}",
+        f"- Successful analyses: {len(results)}",
+        f"- Failures: {len(failures)}",
+        f"- Skipped: {len(skipped)}",
+        f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
         "",
-        "## 成功归档",
+        "## Successful Archives",
         "",
     ]
     if not results:
-        lines.append("- 暂无。")
+        lines.append("- None.")
     for item in results:
         up = item.get("up") or {}
         video = item.get("video") or {}
@@ -1333,27 +1442,27 @@ def _persist_following_batch_index(
         created_text = datetime.fromtimestamp(created).strftime("%Y-%m-%d") if created else ""
         lines.append(
             f"- [{video.get('title', '')}]({link}) "
-            f"｜UP：{up.get('name', '')}｜BV：{video.get('bvid', '')}｜{created_text}"
+            f"| UP: {up.get('name', '')} | BV: {video.get('bvid', '')} | {created_text}"
         )
         if item.get("partial_archive"):
-            lines.append("  - 状态：部分归档")
+            lines.append("  - Status: partial archive")
         thesis = str(item.get("main_thesis") or item.get("summary") or "").strip()
         if thesis:
-            lines.append(f"  - 摘要：{thesis[:240]}")
+            lines.append(f"  - Summary: {thesis[:240]}")
 
-    lines.extend(["", "## 跳过记录", ""])
+    lines.extend(["", "## Skipped", ""])
     if not skipped:
-        lines.append("- 无。")
+        lines.append("- None.")
     for item in skipped:
         up = item.get("up") or {}
         lines.append(
-            f"- 阶段：{item.get('stage', '')}｜UP：{up.get('name', '')}｜"
-            f"原因：{item.get('reason', '')}"
+            f"- Stage: {item.get('stage', '')} | UP: {up.get('name', '')} | "
+            f"Reason: {item.get('reason', '')}"
         )
 
-    lines.extend(["", "## 失败记录", ""])
+    lines.extend(["", "## Failures", ""])
     if not failures:
-        lines.append("- 无。")
+        lines.append("- None.")
     for item in failures:
         up = item.get("up") or {}
         video = item.get("video") or {}
@@ -1362,13 +1471,13 @@ def _persist_following_batch_index(
         if output_path:
             try:
                 rel = Path(output_path).resolve().relative_to(batch_dir.resolve())
-                suffix = f"｜归档：{rel.as_posix()}"
+                suffix = f" | Archive: {rel.as_posix()}"
             except Exception:
-                suffix = f"｜归档：{output_path}"
-        partial = "｜部分归档" if item.get("partial_archive") else ""
+                suffix = f" | Archive: {output_path}"
+        partial = " | Partial archive" if item.get("partial_archive") else ""
         lines.append(
-            f"- 阶段：{item.get('stage', '')}｜UP：{up.get('name', '')}｜"
-            f"BV：{video.get('bvid', '')}｜错误：{item.get('error', '')}"
+            f"- Stage: {item.get('stage', '')} | UP: {up.get('name', '')} | "
+            f"BV: {video.get('bvid', '')} | Error: {item.get('error', '')}"
             f"{partial}{suffix}"
         )
 

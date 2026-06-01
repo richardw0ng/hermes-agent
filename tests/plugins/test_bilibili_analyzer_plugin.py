@@ -2,6 +2,7 @@ import json
 import builtins
 import types
 from types import SimpleNamespace
+from pathlib import Path
 
 from plugins.bilibili_analyzer import analysis
 from plugins.bilibili_analyzer import asr
@@ -587,6 +588,7 @@ def test_analyze_handler_returns_stage_and_partial_data_on_analysis_error(monkey
                 "url_or_bvid": "BV1xx411c7mD",
                 "include_comments": True,
                 "comment_limit": 30,
+                "persist_file": False,
             }
         )
     )
@@ -625,6 +627,40 @@ def test_analyze_handler_archives_to_standard_output_dir_by_default(monkeypatch,
     assert result["output_path"].startswith(str(output_dir))
     assert result["output_path"].endswith("_analysis.md")
     assert "# Analysis" in output_file.read_text(encoding="utf-8")
+    assert result["state_path"].endswith(".run.json")
+
+
+def test_analyze_handler_archives_partial_file_on_analysis_error(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    transcript = {
+        "metadata": {
+            "bvid": "BV1xx411c7mD",
+            "cid": 123,
+            "title": "Sample Title",
+            "usable_for_analysis": True,
+        },
+        "segments": [{"start": 0, "end": 1, "text": "hello transcript"}],
+    }
+
+    monkeypatch.setattr(tools, "fetch_transcript", lambda *_args, **_kwargs: transcript)
+
+    def fail_analyze(*_args, **_kwargs):
+        raise RuntimeError("model timeout")
+
+    monkeypatch.setattr(tools, "analyze_transcript", fail_analyze)
+    handler = tools.make_analyze_handler(object())
+    result = json.loads(handler({"url_or_bvid": "BV1xx411c7mD"}))
+
+    assert result["success"] is False
+    assert result["stage"] == "analyze"
+    assert result["output_path"].endswith("_analysis.md")
+    output_text = Path(result["output_path"]).read_text(encoding="utf-8")
+    assert "Status: failed" in output_text
+    assert "model timeout" in output_text
+    assert "hello transcript" in output_text
+    state = json.loads(Path(result["state_path"]).read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["stage"] == "analyze"
 
 
 def test_analyze_handler_can_disable_auto_archive(monkeypatch, tmp_path):
@@ -681,12 +717,11 @@ def test_analyze_handler_archives_partial_when_analysis_fails(monkeypatch, tmp_p
         )
     )
 
-    partial_path = tmp_path / "failed_partial.md"
     assert result["success"] is False
     assert result["stage"] == "analyze"
     assert result["partial_archive"] is True
-    assert result["output_path"] == str(partial_path)
-    text = partial_path.read_text(encoding="utf-8")
+    assert result["output_path"] == str(output_path)
+    text = output_path.read_text(encoding="utf-8")
     assert "Connection error" in text
     assert "hello transcript" in text
 
