@@ -2526,6 +2526,8 @@ def _recoverable_pool_provider(
                         return rt_provider
             except Exception:
                 pass
+    if normalized in {"", "auto", "custom"} and base:
+        return "local/custom"
     return None
 
 
@@ -5124,21 +5126,23 @@ def call_llm(
         # literally cannot serve this request regardless of user intent.
         is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
         if should_fallback and (is_auto or is_capacity_error):
+            failed_provider_label = (
+                _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+                or resolved_provider
+            )
             if _is_payment_error(first_err):
                 reason = "payment error"
                 # Resolve the actual provider label (resolved_provider may be
                 # "auto"; the client's base_url tells us which backend got the
                 # 402). Mark THAT label unhealthy so subsequent aux calls
                 # skip it instead of paying another doomed RTT.
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
-                )
+                _mark_provider_unhealthy(failed_provider_label)
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, failed_provider_label, first_err)
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
@@ -5149,13 +5153,13 @@ def call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
+                    failed_provider_label, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, failed_provider_label or "auto", reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        failed_provider_label, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
@@ -5172,7 +5176,7 @@ def call_llm(
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
-                task or "call", reason, resolved_provider,
+                task or "call", reason, failed_provider_label,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
         # httpx transport, half-read stream, dead async loop).  Drop it from
@@ -5527,17 +5531,19 @@ async def async_call_llm(
         is_auto = resolved_provider in {"auto", "", None}
         is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
         if should_fallback and (is_auto or is_capacity_error):
+            failed_provider_label = (
+                _recoverable_pool_provider(resolved_provider, client)
+                or resolved_provider
+            )
             if _is_payment_error(first_err):
                 reason = "payment error"
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
-                )
+                _mark_provider_unhealthy(failed_provider_label)
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, failed_provider_label, first_err)
 
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
@@ -5547,13 +5553,13 @@ async def async_call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
+                    failed_provider_label, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, failed_provider_label or "auto", reason=reason)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        failed_provider_label, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
@@ -5574,7 +5580,7 @@ async def async_call_llm(
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
-                task or "call", reason, resolved_provider,
+                task or "call", reason, failed_provider_label,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout
         # so the next aux call rebuilds.  See issue #23432.

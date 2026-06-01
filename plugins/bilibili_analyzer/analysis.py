@@ -78,6 +78,59 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
     "required": ["video", "main_thesis", "viewpoints", "summary"],
 }
 
+MARKET_REPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "executive_summary": {"type": "string"},
+        "market_sentiment": {
+            "type": "object",
+            "properties": {
+                "overall": {"type": "string"},
+                "confidence": {"type": "string"},
+                "bullish_signals": {"type": "array", "items": {"type": "string"}},
+                "bearish_signals": {"type": "array", "items": {"type": "string"}},
+                "neutral_or_wait_and_see_signals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+        },
+        "consensus_views": {"type": "array", "items": {"type": "string"}},
+        "divergent_views": {"type": "array", "items": {"type": "string"}},
+        "themes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "theme": {"type": "string"},
+                    "stance": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "commentary_signals": {
+            "type": "object",
+            "properties": {
+                "high_information_consensus": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "pushback_or_corrections": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "new_clues": {"type": "array", "items": {"type": "string"}},
+                "filtered_noise_summary": {"type": "string"},
+            },
+        },
+        "watchlist": {"type": "array", "items": {"type": "string"}},
+        "risk_flags": {"type": "array", "items": {"type": "string"}},
+        "source_coverage": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["executive_summary", "market_sentiment", "source_coverage"],
+}
+
 
 def transcript_to_text(
     segments: list[dict[str, Any]], max_chars: int | None = None
@@ -124,6 +177,7 @@ def analyze_transcript(
     output_format: str = "markdown",
     chunk_minutes: int = 4,
     max_tokens: int = 3000,
+    llm_timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
     chunks = chunk_segments(segments, max(60, int(chunk_minutes) * 60))
     chunk_notes = []
@@ -148,6 +202,7 @@ def analyze_transcript(
             ],
             temperature=0.2,
             max_tokens=max_tokens,
+            timeout=llm_timeout_seconds,
             purpose="bilibili_chunk_summary",
         )
         chunk_notes.append(
@@ -186,6 +241,7 @@ def analyze_transcript(
         schema_name="bilibili_video_viewpoint_analysis",
         temperature=0.2,
         max_tokens=max_tokens,
+        timeout=llm_timeout_seconds,
         purpose="bilibili_global_analysis",
     )
     parsed = (
@@ -256,4 +312,291 @@ def render_markdown(data: dict[str, Any]) -> str:
                     f"- {item.get('message', '')} "
                     f"(user={user}, like={like}, score={score})"
                 )
+    return "\n".join(lines).strip()
+
+
+def analyze_market_batch(
+    llm: Any,
+    *,
+    group: dict[str, Any],
+    records: list[dict[str, Any]],
+    failures: list[dict[str, Any]] | None = None,
+    skipped: list[dict[str, Any]] | None = None,
+    llm_timeout_seconds: float = 90.0,
+    max_tokens: int = 6000,
+) -> dict[str, Any]:
+    """Synthesize one market report from video transcripts and comments.
+
+    The batch report intentionally consumes partial records too. A per-video
+    analysis timeout should not erase the transcript/comment evidence already
+    collected for the batch.
+    """
+    compact_records = [
+        _compact_market_record(record)
+        for record in records
+        if record.get("transcript") or record.get("analysis") or record.get("comments")
+    ]
+    if not compact_records:
+        report = _heuristic_market_report(group, [], failures or [], skipped or [])
+        report["markdown"] = render_market_report_markdown(report)
+        return report
+
+    instructions = (
+        "你是市场观点研究助理。请基于一组B站财经/投资视频的字幕、UP主观点和高信息量评论，"
+        "生成一份整体市场情绪分析报告。要求：\n"
+        "1. 分别采集各方观点，但最终输出批次级综合判断。\n"
+        "2. 明确区分UP主观点、评论区补充、评论区反驳/修正。\n"
+        "3. 只采纳有信息增量的评论；纯情绪、刷屏、站队、无理由喊涨喊跌要过滤。\n"
+        "4. 不提供投资建议，不给买卖指令；只输出市场情绪、分歧、风险、待验证线索。\n"
+        "5. 所有结论都要能追溯到source_coverage里的UP主或评论证据。"
+    )
+    try:
+        structured = llm.complete_structured(
+            instructions=instructions,
+            input=[
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "group": group,
+                            "records": compact_records,
+                            "failures": failures or [],
+                            "skipped": skipped or [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+            json_schema=MARKET_REPORT_SCHEMA,
+            json_mode=True,
+            schema_name="bilibili_batch_market_sentiment_report",
+            temperature=0.2,
+            max_tokens=max_tokens,
+            timeout=llm_timeout_seconds,
+            purpose="bilibili_batch_market_report",
+        )
+        report = structured.parsed if isinstance(structured.parsed, dict) else {}
+        if not report:
+            report = _heuristic_market_report(group, compact_records, failures or [], skipped or [])
+            report["llm_warning"] = "Batch report LLM returned non-JSON output."
+    except Exception as exc:
+        report = _heuristic_market_report(group, compact_records, failures or [], skipped or [])
+        report["llm_warning"] = f"Batch report LLM failed: {exc}"
+
+    report["group"] = group
+    report["video_count"] = len(records)
+    report["partial_video_count"] = sum(1 for record in records if not record.get("success"))
+    report["comment_count"] = sum(
+        len(((record.get("comments") or {}).get("comments") or []))
+        for record in records
+    )
+    report["markdown"] = render_market_report_markdown(report)
+    return report
+
+
+def _compact_market_record(record: dict[str, Any]) -> dict[str, Any]:
+    transcript = record.get("transcript") or {}
+    metadata = transcript.get("metadata") or {}
+    comments_payload = record.get("comments") or {}
+    comments = comments_payload.get("comments") or []
+    analysis = record.get("analysis") or {}
+    video = record.get("video") or {}
+    up = record.get("up") or {}
+    return {
+        "success": bool(record.get("success")),
+        "error": record.get("error") or "",
+        "up": up.get("name") or video.get("owner_name") or metadata.get("owner") or "",
+        "title": video.get("title") or metadata.get("title") or "",
+        "bvid": video.get("bvid") or metadata.get("bvid") or "",
+        "duration": video.get("duration") or metadata.get("duration") or 0,
+        "analysis": {
+            "main_thesis": analysis.get("main_thesis") or "",
+            "summary": analysis.get("summary") or "",
+            "viewpoints": (analysis.get("viewpoints") or [])[:6],
+            "risk_or_controversy": (
+                analysis.get("opposing_or_controversial_points") or []
+            )[:4],
+            "key_facts": (analysis.get("key_facts") or [])[:5],
+        },
+        "transcript_excerpt": transcript_to_text(
+            transcript.get("segments") or [],
+            max_chars=3600,
+        ),
+        "comment_metadata": comments_payload.get("metadata") or {},
+        "high_information_comments": _compact_market_comments(comments),
+    }
+
+
+def _compact_market_comments(comments: list[dict[str, Any]], limit: int = 16) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for comment in comments[:limit]:
+        entry = {
+            "user": comment.get("user") or "",
+            "message": str(comment.get("message") or "")[:360],
+            "like": int(comment.get("like") or 0),
+            "reply_count": int(comment.get("reply_count") or 0),
+            "information_score": comment.get("information_score", 0),
+            "filter_reasons": comment.get("filter_reasons") or [],
+        }
+        replies = []
+        for reply in comment.get("replies") or []:
+            replies.append(
+                {
+                    "user": reply.get("user") or "",
+                    "message": str(reply.get("message") or "")[:240],
+                    "like": int(reply.get("like") or 0),
+                }
+            )
+            if len(replies) >= 3:
+                break
+        if replies:
+            entry["replies"] = replies
+        compacted.append(entry)
+    return compacted
+
+
+def _heuristic_market_report(
+    group: dict[str, Any],
+    records: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    bullish_terms = ("反弹", "上涨", "机会", "看多", "修复", "突破", "景气", "增持", "低估")
+    bearish_terms = ("风险", "下跌", "回调", "亏", "减仓", "高估", "压力", "分歧", "谨慎")
+    bullish: list[str] = []
+    bearish: list[str] = []
+    neutral: list[str] = []
+    comment_clues: list[str] = []
+    coverage: list[str] = []
+    for record in records:
+        title = record.get("title") or ""
+        up = record.get("up") or ""
+        text = " ".join(
+            str(part or "")
+            for part in (
+                title,
+                (record.get("analysis") or {}).get("main_thesis"),
+                (record.get("analysis") or {}).get("summary"),
+                record.get("transcript_excerpt"),
+            )
+        )
+        source = f"{up}: {title}".strip(": ")
+        if source:
+            coverage.append(source)
+        line = source or (record.get("bvid") or "unknown video")
+        if any(term in text for term in bullish_terms):
+            bullish.append(line)
+        elif any(term in text for term in bearish_terms):
+            bearish.append(line)
+        else:
+            neutral.append(line)
+        for comment in record.get("high_information_comments") or []:
+            msg = str(comment.get("message") or "").strip()
+            if msg:
+                comment_clues.append(f"{line} / 评论: {msg[:160]}")
+    overall = "neutral"
+    if len(bullish) > len(bearish) + len(neutral) / 2:
+        overall = "bullish"
+    elif len(bearish) > len(bullish) + len(neutral) / 2:
+        overall = "bearish"
+    return {
+        "group": group,
+        "executive_summary": (
+            "已基于可用字幕、单条分析结果和高信息量评论生成降级版市场情绪报告。"
+            "由于批次级LLM未完成，以下结论偏向证据整理而非深度综合。"
+        ),
+        "market_sentiment": {
+            "overall": overall,
+            "confidence": "low" if failures else "medium",
+            "bullish_signals": bullish[:8],
+            "bearish_signals": bearish[:8],
+            "neutral_or_wait_and_see_signals": neutral[:8],
+        },
+        "consensus_views": bullish[:5] if bullish else neutral[:5],
+        "divergent_views": bearish[:5],
+        "themes": [],
+        "commentary_signals": {
+            "high_information_consensus": comment_clues[:8],
+            "pushback_or_corrections": [],
+            "new_clues": comment_clues[8:16],
+            "filtered_noise_summary": "短表态、重复、无理由情绪输出未进入报告。",
+        },
+        "watchlist": [],
+        "risk_flags": [str(item.get("error") or item) for item in failures[:5]],
+        "source_coverage": coverage,
+        "skipped": skipped,
+    }
+
+
+def render_market_report_markdown(data: dict[str, Any]) -> str:
+    sentiment = data.get("market_sentiment") or {}
+    comments = data.get("commentary_signals") or {}
+    lines = [
+        "# Bilibili Market Sentiment Report",
+        "",
+        f"- Group: {(data.get('group') or {}).get('name', '')}",
+        f"- Videos: {data.get('video_count', 0)}",
+        f"- Partial videos: {data.get('partial_video_count', 0)}",
+        f"- High-information comments: {data.get('comment_count', 0)}",
+        f"- Overall sentiment: {sentiment.get('overall', '')}",
+        f"- Confidence: {sentiment.get('confidence', '')}",
+        "",
+        "## Executive Summary",
+        "",
+        str(data.get("executive_summary") or ""),
+    ]
+    if data.get("llm_warning"):
+        lines.extend(["", "## Generation Warning", "", str(data.get("llm_warning"))])
+    for title, key in (
+        ("Bullish Signals", "bullish_signals"),
+        ("Bearish Signals", "bearish_signals"),
+        ("Neutral / Wait-and-see Signals", "neutral_or_wait_and_see_signals"),
+    ):
+        items = sentiment.get(key) or []
+        if items:
+            lines.extend(["", f"## {title}", ""])
+            lines.extend(f"- {item}" for item in items)
+    for title, key in (
+        ("Consensus Views", "consensus_views"),
+        ("Divergent Views", "divergent_views"),
+        ("Risk Flags", "risk_flags"),
+        ("Watchlist", "watchlist"),
+    ):
+        items = data.get(key) or []
+        if items:
+            lines.extend(["", f"## {title}", ""])
+            lines.extend(f"- {item}" for item in items)
+    themes = data.get("themes") or []
+    if themes:
+        lines.extend(["", "## Themes", ""])
+        for item in themes:
+            lines.append(f"### {item.get('theme', '')} ({item.get('stance', '')})")
+            for evidence in item.get("evidence") or []:
+                lines.append(f"- {evidence}")
+            sources = item.get("sources") or []
+            if sources:
+                lines.append(f"Sources: {', '.join(str(src) for src in sources)}")
+    lines.extend(["", "## Comment Signals", ""])
+    for title, key in (
+        ("High-information consensus", "high_information_consensus"),
+        ("Pushback / corrections", "pushback_or_corrections"),
+        ("New clues", "new_clues"),
+    ):
+        items = comments.get(key) or []
+        if items:
+            lines.extend([f"### {title}", ""])
+            lines.extend(f"- {item}" for item in items)
+            lines.append("")
+    if comments.get("filtered_noise_summary"):
+        lines.extend(["### Filtered Noise", "", str(comments.get("filtered_noise_summary"))])
+    coverage = data.get("source_coverage") or []
+    if coverage:
+        lines.extend(["", "## Source Coverage", ""])
+        lines.extend(f"- {item}" for item in coverage)
+    lines.extend(
+        [
+            "",
+            "> This report is for information synthesis only and is not investment advice.",
+        ]
+    )
     return "\n".join(lines).strip()

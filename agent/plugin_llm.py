@@ -69,6 +69,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Uni
 logger = logging.getLogger(__name__)
 
 
+def _plugin_auxiliary_task_label(plugin_id: str, purpose: Optional[str]) -> str:
+    """Return a readable auxiliary task label for plugin-owned LLM calls."""
+    plugin_part = re.sub(r"[^A-Za-z0-9]+", "_", plugin_id or "plugin").strip("_")
+    purpose_part = re.sub(r"[^A-Za-z0-9]+", "_", purpose or "").strip("_")
+    if purpose_part:
+        return f"plugin_{plugin_part}_{purpose_part}"
+    return f"plugin_{plugin_part}"
+
+
 # ---------------------------------------------------------------------------
 # Public dataclasses
 # ---------------------------------------------------------------------------
@@ -484,6 +493,63 @@ def _parse_structured_text(
     return parsed, "json"
 
 
+def _build_json_repair_messages(
+    *,
+    text: str,
+    json_schema: Optional[Any],
+    schema_name: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Build a narrow repair prompt for malformed structured output."""
+    parts = [
+        "Convert the following model output into one valid JSON object.",
+        "Return only JSON. Do not include prose or markdown fences.",
+    ]
+    if schema_name:
+        parts.append(f"Schema name: {schema_name}")
+    if json_schema is not None:
+        try:
+            schema_text = json.dumps(json_schema, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            schema_text = str(json_schema)
+        parts.append(f"JSON schema:\n{schema_text}")
+    parts.append(f"Model output to repair:\n{text}")
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You repair malformed JSON for a plugin pipeline. "
+                "Preserve the original meaning and do not invent facts."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "\n\n".join(parts)}],
+        },
+    ]
+
+
+def _is_response_format_unavailable(exc: Exception) -> bool:
+    """Return True when an OpenAI-compatible provider rejects
+    ``response_format`` for the selected model/backend.
+
+    Several providers expose chat-completions-compatible endpoints but do not
+    support OpenAI's structured-output request body. Retrying without the
+    request-level hint still preserves local JSON parsing/validation because
+    the schema is already included in the prompt by ``_build_structured_messages``.
+    """
+    text = str(exc).lower()
+    return (
+        "response_format" in text
+        and (
+            "unavailable" in text
+            or "unsupported" in text
+            or "not support" in text
+            or "does not support" in text
+            or "invalid_request_error" in text
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Usage extraction
 # ---------------------------------------------------------------------------
@@ -657,6 +723,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            purpose=purpose,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -734,21 +801,83 @@ class PluginLlm:
         )
         extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
 
-        real_provider, real_model, response = self._invoke_sync(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=extra_body,
-        )
+        used_response_format = bool(extra_body)
+        try:
+            real_provider, real_model, response = self._invoke_sync(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=extra_body,
+                purpose=purpose,
+            )
+        except Exception as exc:
+            if not extra_body or not _is_response_format_unavailable(exc):
+                raise
+            logger.info(
+                "plugin_llm.complete_structured provider rejected response_format; "
+                "retrying without request-level structured output "
+                "plugin=%s purpose=%s error=%s",
+                self._plugin_id,
+                purpose or "",
+                exc,
+            )
+            used_response_format = False
+            real_provider, real_model, response = self._invoke_sync(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=None,
+                purpose=purpose,
+            )
         text = _extract_text(response)
         usage = _extract_usage(response)
-        parsed, content_type = _parse_structured_text(
-            text=text, json_mode=json_mode, json_schema=json_schema
-        )
+        repaired_json = False
+        try:
+            parsed, content_type = _parse_structured_text(
+                text=text, json_mode=json_mode, json_schema=json_schema
+            )
+        except ValueError as exc:
+            if not (json_mode or json_schema is not None):
+                raise
+            parsed, content_type, text, usage = self._repair_structured_sync(
+                text=text,
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                purpose=purpose,
+                original_error=exc,
+            )
+            repaired_json = True
+        if content_type != "json" and (json_mode or json_schema is not None):
+            parsed, content_type, text, usage = self._repair_structured_sync(
+                text=text,
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                purpose=purpose,
+                original_error=None,
+            )
+            repaired_json = True
         result = PluginLlmStructuredResult(
             text=text,
             provider=real_provider,
@@ -762,6 +891,8 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "response_format": "request" if used_response_format else "prompt",
+                "json_repair": repaired_json,
             },
         )
         logger.info(
@@ -804,6 +935,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            purpose=purpose,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -861,21 +993,83 @@ class PluginLlm:
             system_prompt=system_prompt,
         )
         extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
-        real_provider, real_model, response = await self._invoke_async(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=extra_body,
-        )
+        used_response_format = bool(extra_body)
+        try:
+            real_provider, real_model, response = await self._invoke_async(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=extra_body,
+                purpose=purpose,
+            )
+        except Exception as exc:
+            if not extra_body or not _is_response_format_unavailable(exc):
+                raise
+            logger.info(
+                "plugin_llm.acomplete_structured provider rejected response_format; "
+                "retrying without request-level structured output "
+                "plugin=%s purpose=%s error=%s",
+                self._plugin_id,
+                purpose or "",
+                exc,
+            )
+            used_response_format = False
+            real_provider, real_model, response = await self._invoke_async(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=None,
+                purpose=purpose,
+            )
         text = _extract_text(response)
         usage = _extract_usage(response)
-        parsed, content_type = _parse_structured_text(
-            text=text, json_mode=json_mode, json_schema=json_schema
-        )
+        repaired_json = False
+        try:
+            parsed, content_type = _parse_structured_text(
+                text=text, json_mode=json_mode, json_schema=json_schema
+            )
+        except ValueError as exc:
+            if not (json_mode or json_schema is not None):
+                raise
+            parsed, content_type, text, usage = await self._repair_structured_async(
+                text=text,
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                purpose=purpose,
+                original_error=exc,
+            )
+            repaired_json = True
+        if content_type != "json" and (json_mode or json_schema is not None):
+            parsed, content_type, text, usage = await self._repair_structured_async(
+                text=text,
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                purpose=purpose,
+                original_error=None,
+            )
+            repaired_json = True
         return PluginLlmStructuredResult(
             text=text,
             provider=real_provider,
@@ -889,10 +1083,106 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "response_format": "request" if used_response_format else "prompt",
+                "json_repair": repaired_json,
             },
         )
 
     # -- internals ---------------------------------------------------------
+
+    def _repair_structured_sync(
+        self,
+        *,
+        text: str,
+        json_mode: bool,
+        json_schema: Optional[Any],
+        schema_name: Optional[str],
+        provider_override: Optional[str],
+        model_override: Optional[str],
+        profile_override: Optional[str],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        timeout: Optional[float],
+        purpose: Optional[str],
+        original_error: Optional[Exception],
+    ) -> tuple[Optional[Any], str, str, PluginLlmUsage]:
+        logger.info(
+            "plugin_llm.complete_structured repairing JSON output plugin=%s purpose=%s error=%s",
+            self._plugin_id,
+            purpose or "",
+            original_error or "parse_failed",
+        )
+        repair_messages = _build_json_repair_messages(
+            text=text,
+            json_schema=json_schema,
+            schema_name=schema_name,
+        )
+        _repair_provider, _repair_model, repair_response = self._invoke_sync(
+            messages=repair_messages,
+            provider_override=provider_override,
+            model_override=model_override,
+            profile_override=profile_override,
+            temperature=0.0 if temperature is None else min(float(temperature), 0.2),
+            max_tokens=max_tokens,
+            timeout=timeout,
+            extra_body=None,
+            purpose=purpose,
+        )
+        repaired_text = _extract_text(repair_response)
+        repaired_usage = _extract_usage(repair_response)
+        parsed, content_type = _parse_structured_text(
+            text=repaired_text,
+            json_mode=json_mode,
+            json_schema=json_schema,
+        )
+        return parsed, content_type, repaired_text, repaired_usage
+
+    async def _repair_structured_async(
+        self,
+        *,
+        text: str,
+        json_mode: bool,
+        json_schema: Optional[Any],
+        schema_name: Optional[str],
+        provider_override: Optional[str],
+        model_override: Optional[str],
+        profile_override: Optional[str],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        timeout: Optional[float],
+        purpose: Optional[str],
+        original_error: Optional[Exception],
+    ) -> tuple[Optional[Any], str, str, PluginLlmUsage]:
+        logger.info(
+            "plugin_llm.acomplete_structured repairing JSON output plugin=%s purpose=%s error=%s",
+            self._plugin_id,
+            purpose or "",
+            original_error or "parse_failed",
+        )
+        repair_messages = _build_json_repair_messages(
+            text=text,
+            json_schema=json_schema,
+            schema_name=schema_name,
+        )
+        _repair_provider, _repair_model, repair_response = await self._invoke_async(
+            messages=repair_messages,
+            provider_override=provider_override,
+            model_override=model_override,
+            profile_override=profile_override,
+            temperature=0.0 if temperature is None else min(float(temperature), 0.2),
+            max_tokens=max_tokens,
+            timeout=timeout,
+            extra_body=None,
+            purpose=purpose,
+        )
+        repaired_text = _extract_text(repair_response)
+        repaired_usage = _extract_usage(repair_response)
+        parsed, content_type = _parse_structured_text(
+            text=repaired_text,
+            json_mode=json_mode,
+            json_schema=json_schema,
+        )
+        return parsed, content_type, repaired_text, repaired_usage
 
     @staticmethod
     def _json_response_format(
@@ -927,6 +1217,7 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        purpose: Optional[str] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
@@ -947,7 +1238,7 @@ class PluginLlm:
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = call_llm(
-            task=None,
+            task=_plugin_auxiliary_task_label(self._plugin_id, purpose),
             provider=provider_override,
             model=model_override,
             messages=messages,
@@ -974,6 +1265,7 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        purpose: Optional[str] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
             return await self._async_caller(
@@ -991,7 +1283,7 @@ class PluginLlm:
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = await async_call_llm(
-            task=None,
+            task=_plugin_auxiliary_task_label(self._plugin_id, purpose),
             provider=provider_override,
             model=model_override,
             messages=messages,

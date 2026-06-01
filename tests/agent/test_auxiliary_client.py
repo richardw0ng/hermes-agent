@@ -2645,6 +2645,49 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert time.monotonic() - started < 0.14
 
 
+class TestAuxiliaryAutoFallbackLoopGuard:
+    def test_auto_connection_error_does_not_retry_same_custom_endpoint(self):
+        import agent.auxiliary_client as aux
+
+        client = MagicMock()
+        client.base_url = "https://example-custom.invalid/v1/"
+        client.chat.completions.create.side_effect = TimeoutError("Request timed out.")
+
+        tried = []
+
+        def no_client(label):
+            def _try():
+                tried.append(label)
+                return None, None
+            return _try
+
+        def local_custom_should_be_skipped():
+            raise AssertionError("local/custom fallback should be skipped after it already failed")
+
+        with patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch.object(
+            aux,
+            "_get_cached_client",
+            return_value=(client, "glm-5.1"),
+        ), patch.object(
+            aux,
+            "_get_provider_chain",
+            return_value=[
+                ("openrouter", no_client("openrouter")),
+                ("nous", no_client("nous")),
+                ("local/custom", local_custom_should_be_skipped),
+                ("api-key", no_client("api-key")),
+            ],
+        ):
+            with pytest.raises(TimeoutError):
+                call_llm(messages=[{"role": "user", "content": "summarize"}])
+
+        assert tried == ["openrouter", "nous", "api-key"]
+
+
 class TestCodexAuxiliaryAdapterNullOutputRecovery:
     def test_recovers_output_item_when_terminal_event_has_null_output(self):
         """Regression for #11179 in auxiliary calls.

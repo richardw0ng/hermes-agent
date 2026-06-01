@@ -596,7 +596,7 @@ def test_analyze_handler_returns_stage_and_partial_data_on_analysis_error(monkey
     assert result["stage"] == "analyze"
     assert result["transcript"] == transcript
     assert result["comments"]["analysis_comment_count"] == 1
-    assert len(seen["comments"][0]["message"]) <= 240
+    assert len(seen["comments"][0]["message"]) <= 320
 
 
 def test_analyze_handler_archives_to_standard_output_dir_by_default(monkeypatch, tmp_path):
@@ -626,7 +626,9 @@ def test_analyze_handler_archives_to_standard_output_dir_by_default(monkeypatch,
     assert result["success"] is True
     assert result["output_path"].startswith(str(output_dir))
     assert result["output_path"].endswith("_analysis.md")
+    assert result["pdf_path"].endswith("_analysis.pdf")
     assert "# Analysis" in output_file.read_text(encoding="utf-8")
+    assert Path(result["pdf_path"]).read_bytes().startswith(b"%PDF-")
     assert result["state_path"].endswith(".run.json")
 
 
@@ -791,20 +793,203 @@ def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
         },
     )
 
+    progress_events = []
+
+    def progress_callback(event, name, message, payload):
+        progress_events.append((event, name, message, payload))
+
     result = tools.analyze_following_group_latest(
         FakeLLM(),
         output_dir=str(tmp_path),
         per_up_limit=10,
         days_back=0,
+        progress_callback=progress_callback,
     )
 
     assert result["analyzed_count"] == 1
     assert result["failure_count"] == 0
     index_path = tmp_path / "index.md"
+    progress_path = tmp_path / "progress.json"
     assert result["index_path"] == str(index_path)
+    assert result["progress_path"] == str(progress_path)
+    assert result["market_report_path"] == str(tmp_path / "market_report.md")
+    assert result["market_report_pdf_path"] == str(tmp_path / "market_report.pdf")
     assert index_path.exists()
+    assert progress_path.exists()
+    assert (tmp_path / "market_report.md").exists()
+    assert (tmp_path / "market_report.pdf").read_bytes().startswith(b"%PDF-")
     assert "测试视频" in index_path.read_text(encoding="utf-8")
-    assert len(list(tmp_path.glob("*.md"))) == 2
+    progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    stages = {event["stage"] for event in progress_payload["events"]}
+    assert {"group_fetch_start", "video_analyze_start", "market_report_complete", "batch_complete"} <= stages
+    assert any(item[0] == "tool.progress" for item in progress_events)
+    assert len(list(tmp_path.glob("*.md"))) == 3
+
+
+def test_following_group_latest_caps_attempted_videos_when_analysis_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tools,
+        "fetch_follow_group_users",
+        lambda **_kwargs: {
+            "group": {"tagid": 123, "name": "璐㈢粡", "count": 1},
+            "groups": [],
+            "users": [{"mid": 42, "name": "璐㈢粡UP"}],
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_user_latest_videos",
+        lambda *_args, **_kwargs: [
+            {"bvid": f"BV{i}xx411c7mD", "title": f"video {i}", "created": 1760000000 + i}
+            for i in range(4)
+        ],
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_transcript",
+        lambda url_or_bvid, **_kwargs: {
+            "metadata": {
+                "bvid": url_or_bvid,
+                "cid": 1,
+                "page": 1,
+                "title": "fail video",
+                "owner": "璐㈢粡UP",
+                "duration": 5,
+                "source": "subtitle",
+                "usable_for_analysis": True,
+            },
+            "segments": [{"start": 0, "end": 5, "text": "transcript"}],
+            "warnings": [],
+            "cache_hit": False,
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "analyze_transcript",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("analysis failed")),
+    )
+
+    result = tools.analyze_following_group_latest(
+        object(),
+        output_dir=str(tmp_path),
+        per_up_limit=4,
+        max_videos_total=2,
+        days_back=0,
+        generate_market_report=False,
+        request_delay_seconds=0,
+    )
+
+    assert result["video_count"] == 2
+    assert result["analyzed_count"] == 0
+    assert result["failure_count"] == 2
+    assert [item["video"]["bvid"] for item in result["failures"]] == [
+        "BV0xx411c7mD",
+        "BV1xx411c7mD",
+    ]
+
+
+def test_creator_stock_pick_backtest_archives_report(monkeypatch, tmp_path):
+    class FakeLLM:
+        def complete_structured(self, **kwargs):
+            if kwargs.get("schema_name") == "bilibili_post_verification_comment_verdict":
+                return SimpleNamespace(
+                    parsed={
+                        "verdict": "mostly_validated",
+                        "score": 88,
+                        "confidence": 0.8,
+                        "summary": "Comments say the call was right.",
+                    },
+                    text='{"score":88}',
+                    audit={},
+                )
+            return SimpleNamespace(
+                parsed={
+                    "picks": [
+                        {
+                            "stock_name": "NVIDIA",
+                            "symbol": "NVDA",
+                            "market": "US",
+                            "stance": "bullish",
+                            "horizon_days": 30,
+                            "confidence": 0.8,
+                            "thesis": "AI demand remains strong",
+                            "evidence": "creator explicitly says NVDA is still a leader",
+                        }
+                    ]
+                },
+                text='{"picks":[]}',
+                audit={},
+            )
+
+    monkeypatch.setattr(
+        tools,
+        "fetch_user_archive_videos",
+        lambda *_args, **_kwargs: [
+            {
+                "bvid": "BV1stockpick",
+                "title": "NVDA view",
+                "created": 1760000000,
+                "author": "财经UP",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_transcript",
+        lambda url_or_bvid, **_kwargs: {
+            "metadata": {
+                "bvid": url_or_bvid,
+                "title": "NVDA view",
+                "owner": "财经UP",
+                "source": "subtitle",
+                "usable_for_analysis": True,
+            },
+            "segments": [{"start": 0, "end": 5, "text": "NVDA is bullish"}],
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "score_pick_against_prices",
+        lambda pick, **_kwargs: {
+            "success": True,
+            "score": 88.0,
+            "symbol": "NVDA",
+            "pct_change": 12.5,
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_comments",
+        lambda *_args, **_kwargs: {
+            "comments": [
+                {
+                    "message": "这个NVDA判断确实说中了",
+                    "like": 10,
+                    "ctime": 1761000000,
+                }
+            ]
+        },
+    )
+
+    result = tools.backtest_creator_stock_picks(
+        FakeLLM(),
+        up_mid=42,
+        start_date="2025-10-01",
+        end_date="2025-11-01",
+        output_dir=str(tmp_path),
+    )
+
+    assert result["video_count"] == 1
+    assert result["pick_count"] == 1
+    assert result["scored_pick_count"] == 1
+    assert result["picks"][0]["comment_verdict"]["score"] == 88.0
+    assert result["picks"][0]["final_score"]["score"] == 88.0
+    assert result["average_score"] == 88.0
+    assert result["report_path"] == str(tmp_path / "stock_pick_backtest.md")
+    assert result["pdf_path"] == str(tmp_path / "stock_pick_backtest.pdf")
+    assert (tmp_path / "stock_pick_backtest.md").exists()
+    assert (tmp_path / "stock_pick_backtest.json").exists()
+    assert (tmp_path / "stock_pick_backtest.pdf").read_bytes().startswith(b"%PDF-")
 
 
 def test_plugin_registers_tools():
@@ -814,6 +999,9 @@ def test_plugin_registers_tools():
 
     class Ctx:
         llm = object()
+
+        def register_auxiliary_task(self, **_kwargs):
+            pass
 
         def register_tool(self, **kwargs):
             registered.append(kwargs)
@@ -825,5 +1013,6 @@ def test_plugin_registers_tools():
         "bilibili_analyze_video",
         "bilibili_fetch_comments",
         "bilibili_analyze_following_group_latest",
+        "bilibili_backtest_creator_stock_picks",
     }
     assert all(item["toolset"] == "bilibili" for item in registered)

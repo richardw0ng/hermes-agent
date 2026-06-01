@@ -291,6 +291,73 @@ def fetch_user_latest_videos(mid: int | str, *, limit: int = 10) -> list[dict[st
         ) from exc
 
 
+def fetch_user_archive_videos(
+    mid: int | str,
+    *,
+    start_ts: int = 0,
+    end_ts: int = 0,
+    max_pages: int = 5,
+    page_size: int = 50,
+) -> list[dict[str, Any]]:
+    """Fetch a user's archive videos across multiple pages.
+
+    Results are ordered by publication time descending. ``start_ts`` and
+    ``end_ts`` are Unix timestamps; zero disables that boundary.
+    """
+    page_size = min(50, max(1, int(page_size or 50)))
+    max_pages = max(1, int(max_pages or 5))
+    start_ts = max(0, int(start_ts or 0))
+    end_ts = max(0, int(end_ts or 0))
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    first_error = ""
+
+    for page in range(1, max_pages + 1):
+        params = {
+            "mid": int(mid),
+            "pn": page,
+            "ps": page_size,
+            "tid": 0,
+            "keyword": "",
+            "order": "pubdate",
+            "platform": "web",
+        }
+        query = urllib.parse.urlencode(params)
+        try:
+            payload = _get_json(f"https://api.bilibili.com/x/space/arc/search?{query}")
+        except Exception as exc:
+            if not first_error:
+                first_error = str(exc)
+            signed = _sign_wbi_params(params)
+            signed_query = urllib.parse.urlencode(signed)
+            try:
+                payload = _get_json(f"https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}")
+            except Exception as signed_exc:
+                raise BilibiliError(
+                    f"Could not fetch archive videos for mid={mid}, page={page}. "
+                    f"unsigned endpoint: {first_error}; signed endpoint: {signed_exc}"
+                ) from signed_exc
+
+        page_videos = _videos_from_space_payload(payload)
+        if not page_videos:
+            break
+        reached_before_start = False
+        for video in page_videos:
+            created = int(video.get("created") or 0)
+            if end_ts and created > end_ts:
+                continue
+            if start_ts and created < start_ts:
+                reached_before_start = True
+                continue
+            bvid = str(video.get("bvid") or "")
+            if bvid and bvid not in seen:
+                seen.add(bvid)
+                results.append(video)
+        if reached_before_start:
+            break
+    return results
+
+
 def _videos_from_space_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if payload.get("code") != 0:
         raise BilibiliError(payload.get("message") or "Could not fetch user videos.")

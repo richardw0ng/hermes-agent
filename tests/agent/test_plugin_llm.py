@@ -645,6 +645,88 @@ class TestPluginLlmFacade:
         assert rf["type"] == "json_schema"
         assert rf["json_schema"]["schema"] == schema
 
+    def test_complete_structured_retries_without_response_format_when_provider_rejects_it(self):
+        calls = []
+
+        def fake_caller(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'message': "
+                    "'This response_format type is unavailable now', "
+                    "'type': 'invalid_request_error'}}"
+                )
+            return "deepseek", "deepseek-v4-flash", _fake_response('{"a": 1}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        result = llm.complete_structured(
+            instructions="Test",
+            input=[PluginLlmTextInput(text="x")],
+            json_schema={"type": "object"},
+        )
+
+        assert result.parsed == {"a": 1}
+        assert calls[0]["extra_body"]["response_format"]["type"] == "json_schema"
+        assert calls[1]["extra_body"] is None
+        assert result.audit["response_format"] == "prompt"
+
+    def test_complete_structured_repairs_non_json_response(self):
+        calls = []
+
+        def fake_caller(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return "deepseek", "deepseek-v4-flash", _fake_response('Result: {"a": 1}')
+            return "deepseek", "deepseek-v4-flash", _fake_response('{"a": 1}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        result = llm.complete_structured(
+            instructions="Test",
+            input=[PluginLlmTextInput(text="x")],
+            json_mode=True,
+        )
+
+        assert result.parsed == {"a": 1}
+        assert result.audit["json_repair"] is True
+        assert calls[1]["extra_body"] is None
+        assert "Model output to repair" in calls[1]["messages"][1]["content"][0]["text"]
+
+    def test_complete_structured_repairs_schema_mismatch(self):
+        pytest.importorskip("jsonschema")
+        calls = []
+
+        def fake_caller(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return "deepseek", "deepseek-v4-flash", _fake_response('{"b": 2}')
+            return "deepseek", "deepseek-v4-flash", _fake_response('{"a": 1}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        result = llm.complete_structured(
+            instructions="Test",
+            input=[PluginLlmTextInput(text="x")],
+            json_schema={
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"],
+            },
+        )
+
+        assert result.parsed == {"a": 1}
+        assert result.audit["json_repair"] is True
+
     def test_complete_structured_with_image_passes_image_url_part(self):
         captured: dict = {}
 
