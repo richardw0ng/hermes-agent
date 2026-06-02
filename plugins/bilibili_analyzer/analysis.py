@@ -124,6 +124,17 @@ MARKET_REPORT_SCHEMA: dict[str, Any] = {
                 "filtered_noise_summary": {"type": "string"},
             },
         },
+        "external_market_sources": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "object"},
+                "high_information_items": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                },
+                "errors": {"type": "array", "items": {"type": "object"}},
+            },
+        },
         "watchlist": {"type": "array", "items": {"type": "string"}},
         "risk_flags": {"type": "array", "items": {"type": "string"}},
         "source_coverage": {"type": "array", "items": {"type": "string"}},
@@ -320,6 +331,7 @@ def analyze_market_batch(
     *,
     group: dict[str, Any],
     records: list[dict[str, Any]],
+    market_sources: dict[str, Any] | None = None,
     failures: list[dict[str, Any]] | None = None,
     skipped: list[dict[str, Any]] | None = None,
     llm_timeout_seconds: float = 90.0,
@@ -337,7 +349,7 @@ def analyze_market_batch(
         if record.get("transcript") or record.get("analysis") or record.get("comments")
     ]
     if not compact_records:
-        report = _heuristic_market_report(group, [], failures or [], skipped or [])
+        report = _heuristic_market_report(group, [], failures or [], skipped or [], market_sources)
         report["markdown"] = render_market_report_markdown(report)
         return report
 
@@ -360,6 +372,7 @@ def analyze_market_batch(
                         {
                             "group": group,
                             "records": compact_records,
+                            "external_market_sources": _compact_external_market_sources(market_sources or {}),
                             "failures": failures or [],
                             "skipped": skipped or [],
                         },
@@ -377,15 +390,17 @@ def analyze_market_batch(
         )
         report = structured.parsed if isinstance(structured.parsed, dict) else {}
         if not report:
-            report = _heuristic_market_report(group, compact_records, failures or [], skipped or [])
+            report = _heuristic_market_report(group, compact_records, failures or [], skipped or [], market_sources)
             report["llm_warning"] = "Batch report LLM returned non-JSON output."
     except Exception as exc:
-        report = _heuristic_market_report(group, compact_records, failures or [], skipped or [])
+        report = _heuristic_market_report(group, compact_records, failures or [], skipped or [], market_sources)
         report["llm_warning"] = f"Batch report LLM failed: {exc}"
 
     report["group"] = group
     report["video_count"] = len(records)
     report["partial_video_count"] = sum(1 for record in records if not record.get("success"))
+    if market_sources:
+        report["external_market_sources"] = _compact_external_market_sources(market_sources)
     report["comment_count"] = sum(
         len(((record.get("comments") or {}).get("comments") or []))
         for record in records
@@ -455,11 +470,37 @@ def _compact_market_comments(comments: list[dict[str, Any]], limit: int = 16) ->
     return compacted
 
 
+def _compact_external_market_sources(payload: dict[str, Any], limit: int = 24) -> dict[str, Any]:
+    items = []
+    for item in payload.get("items") or []:
+        items.append(
+            {
+                "source": item.get("source") or "",
+                "symbol": item.get("symbol") or "",
+                "title": str(item.get("title") or "")[:160],
+                "text": str(item.get("text") or "")[:360],
+                "sentiment": item.get("sentiment") or "neutral",
+                "information_score": item.get("information_score", 0),
+                "url": item.get("url") or "",
+            }
+        )
+        if len(items) >= limit:
+            break
+    return {
+        "summary": payload.get("summary") or {},
+        "keyword": payload.get("keyword") or "",
+        "symbols": payload.get("symbols") or [],
+        "high_information_items": items,
+        "errors": payload.get("errors") or [],
+    }
+
+
 def _heuristic_market_report(
     group: dict[str, Any],
     records: list[dict[str, Any]],
     failures: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
+    market_sources: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     bullish_terms = ("反弹", "上涨", "机会", "看多", "修复", "突破", "景气", "增持", "低估")
     bearish_terms = ("风险", "下跌", "回调", "亏", "减仓", "高估", "压力", "分歧", "谨慎")
@@ -499,7 +540,7 @@ def _heuristic_market_report(
         overall = "bullish"
     elif len(bearish) > len(bullish) + len(neutral) / 2:
         overall = "bearish"
-    return {
+    report = {
         "group": group,
         "executive_summary": (
             "已基于可用字幕、单条分析结果和高信息量评论生成降级版市场情绪报告。"
@@ -526,6 +567,9 @@ def _heuristic_market_report(
         "source_coverage": coverage,
         "skipped": skipped,
     }
+    if market_sources:
+        report["external_market_sources"] = _compact_external_market_sources(market_sources)
+    return report
 
 
 def render_market_report_markdown(data: dict[str, Any]) -> str:
@@ -589,6 +633,30 @@ def render_market_report_markdown(data: dict[str, Any]) -> str:
             lines.append("")
     if comments.get("filtered_noise_summary"):
         lines.extend(["### Filtered Noise", "", str(comments.get("filtered_noise_summary"))])
+    external = data.get("external_market_sources") or {}
+    external_items = external.get("high_information_items") or []
+    if external or external_items:
+        lines.extend(["", "## External Market Sources", ""])
+        summary = external.get("summary") or {}
+        if summary:
+            lines.extend(
+                [
+                    f"- Overall: {summary.get('overall', '')}",
+                    f"- Items: {summary.get('item_count', 0)}",
+                    f"- Bullish/Bearish/Neutral: {summary.get('bullish_count', 0)}/{summary.get('bearish_count', 0)}/{summary.get('neutral_count', 0)}",
+                ]
+            )
+        for item in external_items:
+            source = item.get("source") or "source"
+            sentiment_label = item.get("sentiment") or "neutral"
+            title = item.get("title") or item.get("text") or ""
+            url = item.get("url") or ""
+            suffix = f" ({url})" if url else ""
+            lines.append(f"- [{source}/{sentiment_label}] {title}{suffix}")
+        errors = external.get("errors") or []
+        if errors:
+            lines.extend(["", "### External Source Warnings", ""])
+            lines.extend(f"- {item.get('source', 'source')}: {item.get('error', '')}" for item in errors[:5])
     coverage = data.get("source_coverage") or []
     if coverage:
         lines.extend(["", "## Source Coverage", ""])

@@ -8,6 +8,8 @@ from plugins.bilibili_analyzer import analysis
 from plugins.bilibili_analyzer import asr
 from plugins.bilibili_analyzer import bilibili
 from plugins.bilibili_analyzer import tools
+from plugins.market_sentiment import sources as market_sources
+from plugins.market_sentiment import tools as market_tools
 
 
 def test_extract_bvid_from_url():
@@ -331,6 +333,36 @@ def test_download_audio_cli_avoids_ffmpeg_postprocessor(monkeypatch, tmp_path):
     assert calls["kwargs"]["errors"] == "replace"
 
 
+def test_download_audio_retries_incomplete_ytdlp_download(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("BILIBILI_AUDIO_DOWNLOAD_ATTEMPTS", "2")
+    monkeypatch.setattr(
+        bilibili,
+        "download_audio_via_playurl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bilibili.BilibiliError("Bilibili playurl did not return audio streams.")
+        ),
+    )
+    calls = []
+
+    def fake_download(url, outtmpl):
+        calls.append((url, outtmpl))
+        if len(calls) == 1:
+            part = bilibili.cache_dir() / "BV1xx411c7mD_1.m4a.part"
+            part.write_bytes(b"partial")
+            raise bilibili.BilibiliError("1048576 bytes read, 12088709 more expected")
+        out = bilibili.cache_dir() / "BV1xx411c7mD_1.m4a"
+        out.write_bytes(b"audio")
+
+    monkeypatch.setattr(bilibili, "_download_audio_ytdlp", fake_download)
+
+    audio = bilibili.download_audio("BV1xx411c7mD", 1)
+
+    assert len(calls) == 2
+    assert audio.name == "BV1xx411c7mD_1.m4a"
+    assert not (bilibili.cache_dir() / "BV1xx411c7mD_1.m4a.part").exists()
+
+
 def test_download_audio_falls_back_to_playurl(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     real_import = builtins.__import__
@@ -356,11 +388,13 @@ def test_download_audio_falls_back_to_playurl(monkeypatch, tmp_path):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    monkeypatch.setattr(
-        bilibili,
-        "download_audio_via_playurl",
-        lambda bvid, cid: bilibili.cache_dir() / f"{bvid}_{cid}.m4a",
-    )
+    def fake_playurl(bvid, cid):
+        out = bilibili.cache_dir() / f"{bvid}_{cid}.m4a"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"audio")
+        return out
+
+    monkeypatch.setattr(bilibili, "download_audio_via_playurl", fake_playurl)
     audio = bilibili.download_audio("BV1xx411c7mD", 1)
     assert audio.name == "BV1xx411c7mD_1.m4a"
 
@@ -803,6 +837,7 @@ def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
         output_dir=str(tmp_path),
         per_up_limit=10,
         days_back=0,
+        up_latest_delay_seconds=0,
         progress_callback=progress_callback,
     )
 
@@ -810,12 +845,15 @@ def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
     assert result["failure_count"] == 0
     index_path = tmp_path / "index.md"
     progress_path = tmp_path / "progress.json"
+    checkpoint_path = tmp_path / "checkpoint.json"
     assert result["index_path"] == str(index_path)
     assert result["progress_path"] == str(progress_path)
+    assert result["checkpoint_path"] == str(checkpoint_path)
     assert result["market_report_path"] == str(tmp_path / "market_report.md")
     assert result["market_report_pdf_path"] == str(tmp_path / "market_report.pdf")
     assert index_path.exists()
     assert progress_path.exists()
+    assert checkpoint_path.exists()
     assert (tmp_path / "market_report.md").exists()
     assert (tmp_path / "market_report.pdf").read_bytes().startswith(b"%PDF-")
     assert "测试视频" in index_path.read_text(encoding="utf-8")
@@ -824,6 +862,41 @@ def test_following_group_latest_archives_batch(monkeypatch, tmp_path):
     assert {"group_fetch_start", "video_analyze_start", "market_report_complete", "batch_complete"} <= stages
     assert any(item[0] == "tool.progress" for item in progress_events)
     assert len(list(tmp_path.glob("*.md"))) == 3
+
+
+def test_fetch_user_latest_videos_uses_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "cache_dir", lambda: tmp_path)
+    calls = []
+
+    def fake_latest(mid, *, limit):
+        calls.append((mid, limit))
+        return [{"bvid": "BVcache", "created": 1760000000}]
+
+    monkeypatch.setattr(tools, "fetch_user_latest_videos", fake_latest)
+
+    first = tools._fetch_user_latest_videos_cached(
+        42,
+        limit=30,
+        use_cache=True,
+        force_refresh=False,
+        cache_hours=12,
+        attempts=1,
+        rate_limit_pause_seconds=0,
+    )
+    second = tools._fetch_user_latest_videos_cached(
+        42,
+        limit=30,
+        use_cache=True,
+        force_refresh=False,
+        cache_hours=12,
+        attempts=1,
+        rate_limit_pause_seconds=0,
+    )
+
+    assert len(calls) == 1
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert second["videos"][0]["bvid"] == "BVcache"
 
 
 def test_following_group_latest_caps_attempted_videos_when_analysis_fails(monkeypatch, tmp_path):
@@ -877,6 +950,7 @@ def test_following_group_latest_caps_attempted_videos_when_analysis_fails(monkey
         days_back=0,
         generate_market_report=False,
         request_delay_seconds=0,
+        up_latest_delay_seconds=0,
     )
 
     assert result["video_count"] == 2
@@ -992,6 +1066,351 @@ def test_creator_stock_pick_backtest_archives_report(monkeypatch, tmp_path):
     assert (tmp_path / "stock_pick_backtest.pdf").read_bytes().startswith(b"%PDF-")
 
 
+def test_market_sentiment_sources_normalize_and_filter(monkeypatch):
+    def fake_fetch_json(url, **_kwargs):
+        if "eastmoney" in url:
+            return {
+                "data": {
+                    "list": [
+                        {
+                            "post_title": "新能源订单增长20%，估值仍低，看多后续修复",
+                            "post_content": "公司订单增长20%，利润率改善，估值仍低。",
+                            "post_like_count": 12,
+                            "post_comment_count": 4,
+                            "post_id": "1",
+                        },
+                        {"post_title": "666"},
+                    ]
+                }
+            }
+        if "xueqiu" in url:
+            return {
+                "list": [
+                    {
+                        "text": "<p>短期回调但现金流好，ROE维持高位，继续观察。</p>",
+                        "like_count": 8,
+                        "reply_count": 2,
+                        "id": "2",
+                        "user": {"id": "u1", "screen_name": "alice"},
+                    }
+                ]
+            }
+        return {
+            "data": {
+                "roll_data": [
+                    {
+                        "content": "财联社：AI芯片订单继续放量，产业链景气度修复。",
+                        "id": "3",
+                        "ctime": 1760000000,
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(market_sources, "_fetch_json", fake_fetch_json)
+
+    payload = market_sources.fetch_market_sentiment_sources(
+        keyword="AI",
+        symbols=["600519"],
+        max_items_per_source=5,
+    )
+
+    assert payload["errors"] == []
+    assert payload["summary"]["item_count"] == 3
+    assert any(item["source"] == "eastmoney_guba" for item in payload["items"])
+    assert all(item["text"] != "666" for item in payload["items"])
+    assert payload["summary"]["bullish_count"] >= 1
+
+
+def test_eastmoney_guba_html_fallback(monkeypatch):
+    monkeypatch.setattr(
+        market_sources,
+        "_fetch_json",
+        lambda *_args, **_kwargs: {"re": [], "count": 0, "rc": 0, "me": "系统繁忙"},
+    )
+    monkeypatch.setattr(
+        market_sources,
+        "_fetch_text",
+        lambda *_args, **_kwargs: """
+        <tr class="listitem">
+          <td><div class="read">46</div></td>
+          <td><div class="reply">1</div></td>
+          <td><div class="title"><a href="/news,600519,1719098865.html">贵州茅台这ROE真是稳得一批，最新33.65%</a></div></td>
+          <td><div class="author"><a href="//i.eastmoney.com/u">beawan_han</a></div></td>
+        </tr>
+        """,
+    )
+
+    items = market_sources.fetch_eastmoney_guba(symbols=["600519"], limit=3)
+
+    assert len(items) == 1
+    assert items[0]["source"] == "eastmoney_guba"
+    assert "ROE" in items[0]["title"]
+    assert items[0]["reply_count"] == 1
+
+
+def test_xueqiu_auto_mode_falls_back_to_browser(monkeypatch):
+    monkeypatch.delenv("XUEQIU_FETCH_MODE", raising=False)
+
+    def blocked_http(*_args, **_kwargs):
+        raise market_sources.MarketSourceError("Invalid JSON from xueqiu.com")
+
+    monkeypatch.setattr(market_sources, "_fetch_json", blocked_http)
+    monkeypatch.setattr(
+        market_sources,
+        "_fetch_xueqiu_json_browser",
+        lambda *_args, **_kwargs: {
+            "list": [
+                {
+                    "text": "<p>cash flow improves and ROE remains strong</p>",
+                    "like_count": 9,
+                    "reply_count": 3,
+                    "id": "123",
+                    "user": {"id": "456", "screen_name": "alice"},
+                }
+            ]
+        },
+    )
+
+    items = market_sources.fetch_xueqiu_discussions(
+        symbols=["600519"],
+        limit=5,
+    )
+
+    assert len(items) == 1
+    assert items[0]["source"] == "xueqiu"
+    assert items[0]["url"] == "https://xueqiu.com/456/123"
+
+
+def test_xueqiu_http_mode_does_not_fall_back_to_browser(monkeypatch):
+    monkeypatch.setenv("XUEQIU_FETCH_MODE", "http")
+    browser_called = False
+
+    def blocked_http(*_args, **_kwargs):
+        raise market_sources.MarketSourceError("Invalid JSON from xueqiu.com")
+
+    def browser_fetch(*_args, **_kwargs):
+        nonlocal browser_called
+        browser_called = True
+        return {}
+
+    monkeypatch.setattr(market_sources, "_fetch_json", blocked_http)
+    monkeypatch.setattr(market_sources, "_fetch_xueqiu_json_browser", browser_fetch)
+
+    payload = market_sources.fetch_market_sentiment_sources(
+        keyword="maotai",
+        symbols=["600519"],
+        sources=["xueqiu"],
+        max_items_per_source=5,
+    )
+
+    assert browser_called is False
+    assert payload["items"] == []
+    assert payload["errors"][0]["source"] == "xueqiu"
+    assert "Invalid JSON" in payload["errors"][0]["error"]
+
+
+def test_xueqiu_cookie_header_parser():
+    cookies = market_sources._parse_cookie_header_for_domain(
+        "xq_a_token=abc; xq_id_token=def; malformed",
+        ".xueqiu.com",
+    )
+
+    assert [cookie["name"] for cookie in cookies] == ["xq_a_token", "xq_id_token"]
+    assert all(cookie["domain"] == ".xueqiu.com" for cookie in cookies)
+
+
+def test_fetch_market_sentiment_sources_tool(monkeypatch):
+    monkeypatch.setattr(
+        market_tools,
+        "fetch_market_sentiment_sources",
+        lambda **kwargs: {
+            "keyword": kwargs["keyword"],
+            "symbols": kwargs["symbols"],
+            "items": [{"source": "cls", "text": "AI订单放量", "information_score": 80}],
+            "errors": [],
+            "summary": {"overall": "bullish", "item_count": 1},
+        },
+    )
+
+    result = json.loads(
+        market_tools.handle_fetch_sentiment_sources(
+            {"keyword": "AI", "symbols": ["600519"], "max_items_per_source": 5}
+        )
+    )
+
+    assert result["success"] is True
+    assert result["keyword"] == "AI"
+    assert result["summary"]["overall"] == "bullish"
+
+
+def test_research_market_sources_collects_bilibili_and_finance_sources(monkeypatch):
+    monkeypatch.setattr(
+        market_sources,
+        "search_bilibili_videos",
+        lambda **_kwargs: [
+            {
+                "source": "bilibili",
+                "title": "AI软件股观点",
+                "text": "UP主认为软件股有修复机会",
+                "sentiment": "bullish",
+                "information_score": 70,
+                "url": "https://www.bilibili.com/video/BV1",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        market_sources,
+        "fetch_eastmoney_guba",
+        lambda **_kwargs: [
+            {
+                "source": "eastmoney_guba",
+                "title": "软件板块放量",
+                "text": "讨论资金回流和估值修复",
+                "sentiment": "bullish",
+                "information_score": 80,
+                "url": "https://guba.eastmoney.com/news,1.html",
+            }
+        ],
+    )
+
+    payload = market_sources.research_market_sources(
+        query="AI软件股",
+        sources=["bilibili", "eastmoney_guba"],
+        max_items_per_source=5,
+    )
+
+    assert payload["errors"] == []
+    assert {item["source"] for item in payload["items"]} == {"bilibili", "eastmoney_guba"}
+    assert payload["summary"]["bullish_count"] == 2
+
+
+def test_market_research_sources_tool_synthesizes_with_llm(monkeypatch):
+    class FakeLLM:
+        def complete_structured(self, **kwargs):
+            assert kwargs["schema_name"] == "market_cross_source_research_summary"
+            return SimpleNamespace(
+                parsed={
+                    "executive_summary": "AI软件股讨论偏积极。",
+                    "source_coverage": ["bilibili: 1", "eastmoney_guba: 1"],
+                    "consensus": ["软件股有修复预期"],
+                    "divergences": [],
+                    "high_information_evidence": [
+                        {
+                            "source": "bilibili",
+                            "claim": "UP主看好修复",
+                            "evidence": "视频标题和摘要提到软件股机会",
+                            "url": "https://www.bilibili.com/video/BV1",
+                        }
+                    ],
+                    "risk_flags": ["样本少"],
+                },
+                text='{"executive_summary":"AI软件股讨论偏积极。"}',
+                audit={},
+            )
+
+    monkeypatch.setattr(
+        market_tools,
+        "research_market_sources",
+        lambda **_kwargs: {
+            "query": "AI软件股",
+            "sources": ["bilibili", "eastmoney_guba"],
+            "items": [
+                {
+                    "source": "bilibili",
+                    "title": "AI软件股观点",
+                    "text": "UP主认为软件股有修复机会",
+                    "sentiment": "bullish",
+                    "information_score": 70,
+                    "url": "https://www.bilibili.com/video/BV1",
+                }
+            ],
+            "errors": [],
+            "summary": {"overall": "bullish", "item_count": 1},
+        },
+    )
+
+    handler = market_tools.make_research_sources_handler(FakeLLM())
+    result = json.loads(handler({"query": "AI软件股"}))
+
+    assert result["success"] is True
+    assert result["analysis"]["executive_summary"] == "AI软件股讨论偏积极。"
+    assert "High-information Evidence" in result["analysis"]["markdown"]
+
+
+def test_following_group_latest_includes_market_sources(monkeypatch, tmp_path):
+    captured = {}
+
+    monkeypatch.setattr(
+        tools,
+        "fetch_follow_group_users",
+        lambda **_kwargs: {
+            "group": {"tagid": 123, "name": "投资", "count": 1},
+            "groups": [],
+            "users": [{"mid": 42, "name": "财经UP"}],
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_user_latest_videos",
+        lambda *_args, **_kwargs: [
+            {"bvid": "BV1xx411c7mD", "title": "AI观点", "created": 1760000000}
+        ],
+    )
+    monkeypatch.setattr(
+        tools,
+        "make_analyze_handler",
+        lambda _llm: lambda *_args, **_kwargs: json.dumps(
+            {
+                "success": True,
+                "transcript": {"segments": [{"start": 0, "end": 1, "text": "AI继续修复"}]},
+                "analysis": {"summary": "AI继续修复", "main_thesis": "看多AI"},
+                "comments": {"comments": []},
+                "output_path": str(tmp_path / "video.md"),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        tools,
+        "fetch_market_sentiment_sources",
+        lambda **_kwargs: {
+            "items": [{"source": "cls", "title": "AI订单放量", "text": "AI订单放量", "sentiment": "bullish"}],
+            "summary": {"overall": "bullish", "item_count": 1},
+            "errors": [],
+        },
+    )
+
+    def fake_analyze_market_batch(_llm, **kwargs):
+        captured["market_sources"] = kwargs.get("market_sources")
+        return {
+            "executive_summary": "summary",
+            "market_sentiment": {"overall": "bullish"},
+            "source_coverage": [],
+            "markdown": "# report",
+        }
+
+    monkeypatch.setattr(tools, "analyze_market_batch", fake_analyze_market_batch)
+
+    result = tools.analyze_following_group_latest(
+        object(),
+        output_dir=str(tmp_path),
+        max_up=1,
+        per_up_limit=1,
+        max_videos_total=1,
+        days_back=0,
+        request_delay_seconds=0,
+        up_latest_delay_seconds=0,
+        include_market_sources=True,
+        market_source_symbols=["600519"],
+        market_source_keyword="AI",
+    )
+
+    assert result["market_sources"]["summary"]["overall"] == "bullish"
+    assert captured["market_sources"]["items"][0]["source"] == "cls"
+    assert (tmp_path / "market_report.md").exists()
+
+
 def test_plugin_registers_tools():
     from plugins.bilibili_analyzer import register
 
@@ -1016,3 +1435,20 @@ def test_plugin_registers_tools():
         "bilibili_backtest_creator_stock_picks",
     }
     assert all(item["toolset"] == "bilibili" for item in registered)
+
+
+def test_market_sentiment_plugin_registers_tool():
+    from plugins.market_sentiment import register
+
+    registered = []
+
+    class Ctx:
+        def register_tool(self, **kwargs):
+            registered.append(kwargs)
+
+    register(Ctx())
+    assert {item["name"] for item in registered} == {
+        "market_fetch_sentiment_sources",
+        "market_research_sources",
+    }
+    assert all(item["toolset"] == "market_sentiment" for item in registered)

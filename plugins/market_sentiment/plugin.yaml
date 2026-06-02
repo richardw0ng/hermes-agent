@@ -1,0 +1,8 @@
+name: market_sentiment
+version: 0.1.0
+description: "Fetch external market sentiment sources."
+author: Hermes Agent
+kind: standalone
+provides_tools:
+  - market_fetch_sentiment_sources
+  - market_research_sources

@@ -841,7 +841,10 @@ def download_audio(
     playurl_error = ""
     if cid:
         try:
-            return download_audio_via_playurl(bvid, cid)
+            audio = download_audio_via_playurl(bvid, cid)
+            if _is_usable_audio_file(audio):
+                return audio
+            playurl_error = f"direct playurl produced unusable audio file: {audio}"
         except Exception as exc:
             playurl_error = f"direct playurl failed: {exc}"
             if prefer_playurl:
@@ -851,22 +854,37 @@ def download_audio(
                 pass
 
     ytdlp_error = ""
+    for attempt in range(1, _audio_download_attempts() + 1):
+        _cleanup_audio_download_artifacts(bvid, cid)
+        try:
+            _download_audio_ytdlp(url, outtmpl)
+            ytdlp_error = ""
+            break
+        except Exception as exc:
+            ytdlp_error = f"yt-dlp audio download failed: {exc}"
+            if attempt < _audio_download_attempts() and _looks_like_audio_download_retryable(str(exc)):
+                time.sleep(min(20.0, 2.0 * attempt))
+                continue
+            break
+
+    matches = sorted(cache_dir().glob(f"{bvid}_{cid or 'audio'}.*"))
+    audio = next((p for p in matches if _is_usable_audio_file(p)), None)
+    if not audio and cid:
+        detail = f"; {playurl_error}" if playurl_error else ""
+        raise BilibiliError(
+            (ytdlp_error or "Audio download completed but no audio file was found.")
+            + detail
+        )
+    if not audio:
+        raise BilibiliError(
+            ytdlp_error or "Audio download completed but no audio file was found."
+        )
+    return audio
+
+
+def _download_audio_ytdlp(url: str, outtmpl: str) -> None:
     try:
         import yt_dlp  # type: ignore
-
-        options = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "logger": _QuietYtdlpLogger(),
-        }
-        cookiejar = _bilibili_cookiejar()
-        if cookiejar:
-            options["cookiejar"] = cookiejar
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
     except ImportError:
         command = [
             "yt-dlp",
@@ -889,25 +907,63 @@ def download_audio(
             check=False,
         )
         if completed.returncode != 0:
-            ytdlp_error = "yt-dlp audio download failed: " + (
-                completed.stderr or completed.stdout
-            )[-1000:]
-    except Exception as exc:
-        ytdlp_error = f"yt-dlp audio download failed: {exc}"
+            raise BilibiliError((completed.stderr or completed.stdout)[-1000:])
+        return
 
-    matches = sorted(cache_dir().glob(f"{bvid}_{cid or 'audio'}.*"))
-    audio = next((p for p in matches if p.suffix.lower() in {".m4a", ".mp3", ".wav", ".webm"}), None)
-    if not audio and cid:
-        detail = f"; {playurl_error}" if playurl_error else ""
-        raise BilibiliError(
-            (ytdlp_error or "Audio download completed but no audio file was found.")
-            + detail
-        )
-    if not audio:
-        raise BilibiliError(
-            ytdlp_error or "Audio download completed but no audio file was found."
-        )
-    return audio
+    options = {
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "continuedl": False,
+        "retries": 3,
+        "fragment_retries": 3,
+        "logger": _QuietYtdlpLogger(),
+    }
+    cookiejar = _bilibili_cookiejar()
+    if cookiejar:
+        options["cookiejar"] = cookiejar
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+
+def _audio_download_attempts() -> int:
+    try:
+        return max(1, min(5, int(os.getenv("BILIBILI_AUDIO_DOWNLOAD_ATTEMPTS", "3"))))
+    except ValueError:
+        return 3
+
+
+def _cleanup_audio_download_artifacts(bvid: str, cid: int | None) -> None:
+    prefix = f"{bvid}_{cid or 'audio'}"
+    for path in cache_dir().glob(f"{prefix}*"):
+        if path.suffix.lower() in {".part", ".ytdl", ".temp", ".tmp"} or path.name.endswith(".part"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _is_usable_audio_file(path: Path) -> bool:
+    return (
+        path.suffix.lower() in {".m4a", ".mp3", ".wav", ".webm"}
+        and path.exists()
+        and path.stat().st_size > 0
+    )
+
+
+def _looks_like_audio_download_retryable(message: str) -> bool:
+    text = (message or "").lower()
+    return (
+        "bytes read" in text
+        or "more expected" in text
+        or "incomplete" in text
+        or "connection reset" in text
+        or "timed out" in text
+        or "unexpected_eof" in text
+        or "eof occurred" in text
+    )
 
 
 def download_audio_via_playurl(bvid: str, cid: int) -> Path:

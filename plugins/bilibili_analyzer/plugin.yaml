@@ -8,3 +8,4 @@ provides_tools:
   - bilibili_analyze_video
   - bilibili_fetch_comments
   - bilibili_analyze_following_group_latest
+  - bilibili_backtest_creator_stock_picks

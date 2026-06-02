@@ -21,6 +21,7 @@ from .backtest import (
     score_pick_against_prices,
 )
 from .pdf import write_markdown_pdf
+from plugins.market_sentiment.sources import fetch_market_sentiment_sources
 from .bilibili import (
     BilibiliError,
     cache_dir,
@@ -451,6 +452,47 @@ BILI_ANALYZE_FOLLOWING_GROUP_LATEST_SCHEMA = {
                 "description": "Extra pause after 412/rate-limit errors. Defaults to 60.",
                 "default": 60,
             },
+            "up_latest_delay_seconds": {
+                "type": "number",
+                "description": "Delay between creator archive/list requests. Defaults to 60.",
+                "default": 60,
+            },
+            "up_latest_cache_hours": {
+                "type": "number",
+                "description": "Cache TTL for creator latest-video lists. Defaults to 12 hours.",
+                "default": 12,
+            },
+            "up_latest_rate_limit_pause_seconds": {
+                "type": "number",
+                "description": "Pause after Bilibili 412 on creator latest-video list. Defaults to 900.",
+                "default": 900,
+            },
+            "resume_from_checkpoint": {
+                "type": "boolean",
+                "description": "Reuse batch checkpoint files when output_dir points to an existing batch. Defaults to true.",
+                "default": True,
+            },
+            "include_market_sources": {
+                "type": "boolean",
+                "description": "Fetch Eastmoney Guba, Xueqiu, and CLS market-sentiment context for the batch report.",
+                "default": False,
+            },
+            "market_source_keyword": {
+                "type": "string",
+                "description": "Optional keyword used to filter external market sources.",
+                "default": "",
+            },
+            "market_source_symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Stock symbols/codes for Eastmoney Guba and Xueqiu discussion fetches.",
+                "default": [],
+            },
+            "market_source_limit": {
+                "type": "integer",
+                "description": "Maximum high-information items per external market source. Defaults to 20.",
+                "default": 20,
+            },
         },
         "required": [],
     },
@@ -649,6 +691,14 @@ def make_following_group_latest_handler(llm: Any):
                 retry_attempts=int(args.get("retry_attempts") or 3),
                 request_delay_seconds=float(args.get("request_delay_seconds") if args.get("request_delay_seconds") is not None else 4),
                 rate_limit_pause_seconds=float(args.get("rate_limit_pause_seconds") if args.get("rate_limit_pause_seconds") is not None else 60),
+                up_latest_delay_seconds=float(args.get("up_latest_delay_seconds") if args.get("up_latest_delay_seconds") is not None else 60),
+                up_latest_cache_hours=float(args.get("up_latest_cache_hours") if args.get("up_latest_cache_hours") is not None else 12),
+                up_latest_rate_limit_pause_seconds=float(args.get("up_latest_rate_limit_pause_seconds") if args.get("up_latest_rate_limit_pause_seconds") is not None else 900),
+                resume_from_checkpoint=bool(args.get("resume_from_checkpoint", True)),
+                include_market_sources=bool(args.get("include_market_sources", False)),
+                market_source_keyword=str(args.get("market_source_keyword") or ""),
+                market_source_symbols=[str(item) for item in (args.get("market_source_symbols") or [])],
+                market_source_limit=int(args.get("market_source_limit") or 20),
                 progress_callback=_kwargs.get("progress_callback"),
             )
             return _json({"success": True, **payload})
@@ -973,6 +1023,14 @@ def analyze_following_group_latest(
     retry_attempts: int = 3,
     request_delay_seconds: float = 4,
     rate_limit_pause_seconds: float = 60,
+    up_latest_delay_seconds: float = 60,
+    up_latest_cache_hours: float = 12,
+    up_latest_rate_limit_pause_seconds: float = 900,
+    resume_from_checkpoint: bool = True,
+    include_market_sources: bool = False,
+    market_source_keyword: str = "",
+    market_source_symbols: list[str] | None = None,
+    market_source_limit: int = 20,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
     per_up_limit = min(50, max(1, int(per_up_limit or 10)))
@@ -982,6 +1040,11 @@ def analyze_following_group_latest(
     retry_attempts = max(1, int(retry_attempts or 3))
     request_delay_seconds = max(0.0, float(request_delay_seconds or 0))
     rate_limit_pause_seconds = max(0.0, float(rate_limit_pause_seconds or 0))
+    up_latest_delay_seconds = max(0.0, float(up_latest_delay_seconds or 0))
+    up_latest_cache_hours = max(0.0, float(up_latest_cache_hours or 0))
+    up_latest_rate_limit_pause_seconds = max(0.0, float(up_latest_rate_limit_pause_seconds or 0))
+    market_source_symbols = [str(item).strip() for item in (market_source_symbols or []) if str(item).strip()]
+    market_source_limit = min(100, max(1, int(market_source_limit or 20)))
     reporter = _ProgressReporter(
         progress_callback,
         label="bilibili_analyze_following_group_latest",
@@ -1021,8 +1084,22 @@ def analyze_following_group_latest(
     processed = 0
     latest_fetch_limit = min(50, max(per_up_limit, 30 if days_back else per_up_limit))
     planned_total = max_videos_total or max(1, len(users) * per_up_limit)
+    checkpoint_path = batch_dir / "checkpoint.json"
+    checkpoint = _load_following_checkpoint(checkpoint_path) if resume_from_checkpoint else {}
+    processed_bvids: set[str] = set(checkpoint.get("processed_bvids") or [])
+    skipped_up_mids: set[int] = set(int(mid) for mid in (checkpoint.get("completed_up_mids") or []))
 
     for user_index, user in enumerate(users, start=1):
+        user_mid = int(user["mid"])
+        if user_mid in skipped_up_mids:
+            reporter.emit(
+                "up_checkpoint_skip",
+                f"[UP {user_index}/{len(users)}] Skipping {user.get('name') or user_mid}; checkpoint says complete",
+                up_index=user_index,
+                up_total=len(users),
+                up=user,
+            )
+            continue
         reporter.emit(
             "up_latest_fetch_start",
             f"[UP {user_index}/{len(users)}] Fetching latest videos for {user.get('name') or user.get('mid')}",
@@ -1031,31 +1108,56 @@ def analyze_following_group_latest(
             up=user,
         )
         try:
-            latest = _retry_bilibili_operation(
-                lambda user=user: fetch_user_latest_videos(int(user["mid"]), limit=latest_fetch_limit),
-                label=f"fetch_latest_videos:{user.get('name') or user.get('mid')}",
+            latest_payload = _fetch_user_latest_videos_cached(
+                user_mid,
+                limit=latest_fetch_limit,
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+                cache_hours=up_latest_cache_hours,
                 attempts=retry_attempts,
-                rate_limit_pause_seconds=rate_limit_pause_seconds,
+                rate_limit_pause_seconds=up_latest_rate_limit_pause_seconds,
+                reporter=reporter,
+                label=str(user.get("name") or user_mid),
             )
+            latest = latest_payload["videos"]
+            if not latest_payload.get("cache_hit"):
+                _sleep_between_bilibili_requests(up_latest_delay_seconds)
         except Exception as exc:
-            failure = {
-                "stage": "fetch_latest_videos",
-                "up": user,
-                "error": str(exc),
-            }
-            failures.append(failure)
-            reporter.emit(
-                "up_latest_fetch_failed",
-                f"[UP {user_index}/{len(users)}] Failed to fetch latest videos: {failure['error']}",
-                up_index=user_index,
-                up_total=len(users),
-                up=user,
-                error=failure["error"],
-            )
-            if not continue_on_error:
-                break
-            continue
+            stale_payload = _load_latest_videos_cache(user_mid, latest_fetch_limit, max_age_seconds=0)
+            if stale_payload and stale_payload.get("videos"):
+                latest = stale_payload["videos"]
+                reporter.emit(
+                    "up_latest_stale_cache_used",
+                    f"[UP {user_index}/{len(users)}] Using stale latest-video cache after fetch failure",
+                    up_index=user_index,
+                    up_total=len(users),
+                    up=user,
+                    error=str(exc),
+                    cache_path=stale_payload.get("cache_path", ""),
+                )
+            else:
+                failure = {
+                    "stage": "fetch_latest_videos",
+                    "up": user,
+                    "error": str(exc),
+                }
+                failures.append(failure)
+                reporter.emit(
+                    "up_latest_fetch_failed",
+                    f"[UP {user_index}/{len(users)}] Failed to fetch latest videos: {failure['error']}",
+                    up_index=user_index,
+                    up_total=len(users),
+                    up=user,
+                    error=failure["error"],
+                )
+                if not continue_on_error:
+                    break
+                continue
         selected_videos = _filter_recent_videos(latest, days_back=days_back)[:per_up_limit]
+        selected_videos = [
+            video for video in selected_videos
+            if str(video.get("bvid") or "") not in processed_bvids
+        ]
         reporter.emit(
             "up_latest_fetch_complete",
             f"[UP {user_index}/{len(users)}] Selected {len(selected_videos)} videos from {len(latest)} latest items",
@@ -1068,11 +1170,12 @@ def analyze_following_group_latest(
         if not selected_videos:
             skipped.append(
                 {
-                    "stage": "date_filter",
+                    "stage": "date_filter_or_checkpoint",
                     "up": user,
-                    "reason": f"No videos within the last {days_back} days." if days_back else "No videos returned.",
+                    "reason": f"No unprocessed videos within the last {days_back} days." if days_back else "No unprocessed videos returned.",
                 }
             )
+            _update_following_checkpoint(checkpoint_path, completed_up_mid=user_mid)
             continue
         for video in selected_videos:
             if max_videos_total and len(videos) >= max_videos_total:
@@ -1138,6 +1241,18 @@ def analyze_following_group_latest(
                 item = {"success": False, "error": raw}
             item["up"] = user
             item["video"] = video
+            _update_following_checkpoint(
+                checkpoint_path,
+                processed_bvid=str(video.get("bvid") or ""),
+                video_record={
+                    "success": bool(item.get("success")),
+                    "up": user,
+                    "video": video,
+                    "output_path": item.get("output_path") or str(output_path),
+                    "error": item.get("error") or "",
+                },
+            )
+            processed_bvids.add(str(video.get("bvid") or ""))
             video_records.append(
                 {
                     "success": bool(item.get("success")),
@@ -1198,10 +1313,32 @@ def analyze_following_group_latest(
                 )
                 if not continue_on_error:
                     break
+        _update_following_checkpoint(checkpoint_path, completed_up_mid=user_mid)
         if max_videos_total and len(videos) >= max_videos_total:
             break
         if failures and not continue_on_error:
             break
+
+    market_sources: dict[str, Any] | None = None
+    if include_market_sources:
+        reporter.emit(
+            "market_sources_fetch_start",
+            "Fetching external market sentiment sources",
+            keyword=market_source_keyword,
+            symbols=market_source_symbols,
+            limit=market_source_limit,
+        )
+        market_sources = fetch_market_sentiment_sources(
+            keyword=market_source_keyword or str(group.get("name") or group_name),
+            symbols=market_source_symbols,
+            max_items_per_source=market_source_limit,
+        )
+        reporter.emit(
+            "market_sources_fetch_complete",
+            f"Fetched {len(market_sources.get('items') or [])} external market-source items",
+            summary=market_sources.get("summary") or {},
+            error_count=len(market_sources.get("errors") or []),
+        )
 
     market_report: dict[str, Any] | None = None
     market_report_path = ""
@@ -1218,6 +1355,7 @@ def analyze_following_group_latest(
             llm,
             group=group,
             records=video_records,
+            market_sources=market_sources,
             failures=failures,
             skipped=skipped,
             llm_timeout_seconds=market_report_timeout_seconds,
@@ -1245,6 +1383,7 @@ def analyze_following_group_latest(
         market_report_path=market_report_path,
         market_report_pdf_path=market_report_pdf_path,
         progress_path=progress_path,
+        checkpoint_path=str(checkpoint_path),
     )
     reporter.emit(
         "batch_complete",
@@ -1265,9 +1404,11 @@ def analyze_following_group_latest(
         "batch_dir": str(batch_dir),
         "index_path": str(index_path),
         "progress_path": progress_path,
+        "checkpoint_path": str(checkpoint_path),
         "market_report_path": market_report_path,
         "market_report_pdf_path": market_report_pdf_path,
         "market_report": market_report,
+        "market_sources": market_sources,
         "results": results,
         "failures": failures,
         "skipped": skipped,
@@ -1318,6 +1459,140 @@ def _retry_bilibili_operation(
             if delay > 0:
                 time.sleep(delay)
     raise last_error or BilibiliError(f"{label} failed")
+
+
+def _fetch_user_latest_videos_cached(
+    mid: int,
+    *,
+    limit: int,
+    use_cache: bool,
+    force_refresh: bool,
+    cache_hours: float,
+    attempts: int,
+    rate_limit_pause_seconds: float,
+    reporter: _ProgressReporter | None = None,
+    label: str = "",
+) -> dict[str, Any]:
+    max_age_seconds = int(max(0.0, cache_hours) * 3600)
+    if use_cache and not force_refresh:
+        cached = _load_latest_videos_cache(mid, limit, max_age_seconds=max_age_seconds)
+        if cached:
+            if reporter:
+                reporter.emit(
+                    "up_latest_cache_hit",
+                    f"Using cached latest videos for {label or mid}",
+                    mid=mid,
+                    cache_path=cached.get("cache_path", ""),
+                    cache_age_seconds=cached.get("cache_age_seconds", 0),
+                )
+            return {**cached, "cache_hit": True}
+
+    try:
+        videos = _retry_bilibili_operation(
+            lambda: fetch_user_latest_videos(mid, limit=limit),
+            label=f"fetch_latest_videos:{label or mid}",
+            attempts=attempts,
+            rate_limit_pause_seconds=rate_limit_pause_seconds,
+        )
+    except Exception as exc:
+        _write_latest_rate_limit_state(mid, limit, str(exc))
+        raise
+
+    payload = {
+        "mid": mid,
+        "limit": limit,
+        "videos": videos,
+        "fetched_at": int(time.time()),
+        "cache_hit": False,
+    }
+    if use_cache:
+        cache_path = _latest_videos_cache_path(mid, limit)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return payload
+
+
+def _latest_videos_cache_path(mid: int, limit: int) -> Path:
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", f"latest_{mid}_{limit}.json")
+    return cache_dir() / "latest_videos" / safe
+
+
+def _load_latest_videos_cache(
+    mid: int,
+    limit: int,
+    *,
+    max_age_seconds: int,
+) -> dict[str, Any] | None:
+    path = _latest_videos_cache_path(mid, limit)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    videos = payload.get("videos")
+    if not isinstance(videos, list):
+        return None
+    fetched_at = int(payload.get("fetched_at") or 0)
+    age = int(time.time()) - fetched_at if fetched_at else 0
+    if max_age_seconds > 0 and age > max_age_seconds:
+        return None
+    payload["cache_path"] = str(path)
+    payload["cache_age_seconds"] = age
+    return payload
+
+
+def _write_latest_rate_limit_state(mid: int, limit: int, error: str) -> None:
+    path = cache_dir() / "latest_videos" / f"latest_{mid}_{limit}.rate_limit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mid": mid,
+        "limit": limit,
+        "error": error,
+        "time": datetime.now().isoformat(timespec="seconds"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_following_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _update_following_checkpoint(
+    path: Path,
+    *,
+    processed_bvid: str = "",
+    completed_up_mid: int | None = None,
+    video_record: dict[str, Any] | None = None,
+) -> None:
+    payload = _load_following_checkpoint(path)
+    processed = set(str(item) for item in (payload.get("processed_bvids") or []))
+    completed = set(int(item) for item in (payload.get("completed_up_mids") or []))
+    records = list(payload.get("video_records") or [])
+    if processed_bvid:
+        processed.add(processed_bvid)
+    if completed_up_mid is not None:
+        completed.add(int(completed_up_mid))
+    if video_record:
+        records.append(video_record)
+    payload.update(
+        {
+            "processed_bvids": sorted(processed),
+            "completed_up_mids": sorted(completed),
+            "video_records": records[-500:],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _tool_result_is_retryable(raw: str) -> bool:
@@ -2147,6 +2422,7 @@ def _persist_following_batch_index(
     market_report_path: str = "",
     market_report_pdf_path: str = "",
     progress_path: str = "",
+    checkpoint_path: str = "",
 ) -> Path:
     skipped = skipped or []
     path = batch_dir / "index.md"
@@ -2164,6 +2440,7 @@ def _persist_following_batch_index(
         f"- Market report: {market_report_path or 'Not generated'}",
         f"- Market report PDF: {market_report_pdf_path or 'Not generated'}",
         f"- Progress log: {progress_path or 'Not generated'}",
+        f"- Checkpoint: {checkpoint_path or 'Not generated'}",
         f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
         "",
         "## Successful Archives",
